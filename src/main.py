@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Main orchestration for Snapchat media mapper."""
+"""Main orchestration for Snapchat media mapper - with automatic optimization detection."""
 
 import argparse
 import logging
@@ -7,6 +7,15 @@ import shutil
 import sys
 from pathlib import Path
 from typing import Dict, Set
+
+# Try to use optimized version if dependencies are available
+try:
+    import psutil
+    # Optimized version available, use it
+    from main_optimized import main as optimized_main
+    USE_OPTIMIZED = True
+except ImportError:
+    USE_OPTIMIZED = False
 
 from config import (
     INPUT_DIR,
@@ -160,7 +169,14 @@ def main():
     parser.add_argument("--output", type=Path, default=OUTPUT_DIR, help="Output directory")
     parser.add_argument("--no-clean", action="store_true", help="Don't clean output directory")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
+    parser.add_argument("--no-optimize", action="store_true", help="Disable optimizations")
     args = parser.parse_args()
+    
+    # Use optimized version if available and not disabled
+    if USE_OPTIMIZED and not args.no_optimize:
+        logger.info("Using OPTIMIZED version for better performance with large files")
+        logger.info("To use standard version, run with --no-optimize flag")
+        return optimized_main()
     
     # Setup logging
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))

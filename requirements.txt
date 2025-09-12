@@ -1,0 +1,16 @@
+# Core dependencies for optimized Snapchat Media Mapper
+# These are optional but highly recommended for best performance
+
+# Memory monitoring and system resources
+psutil>=5.9.0
+
+# Streaming JSON processing (optional but recommended for large files)
+ijson>=3.2.0
+
+# Progress bars (optional)
+tqdm>=4.65.0
+
+# Note: The project can run without these dependencies using fallback methods,
+# but performance will be significantly better with them installed.
+# 
+# To install: pip install -r requirements.txt
