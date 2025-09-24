@@ -2,9 +2,12 @@
 
 import json
 import logging
+import os
+import shutil
+from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 # Configuration
 INPUT_DIR = Path("input")
@@ -18,6 +21,33 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+@dataclass
+class MediaFile:
+    """Represents a media file with its metadata."""
+    filename: str
+    source_path: Path
+    media_id: Optional[str] = None
+    timestamp: Optional[int] = None
+    is_merged: bool = False
+    is_grouped: bool = False
+    mapping_method: Optional[str] = None
+
+@dataclass
+class Stats:
+    """Centralized statistics tracking."""
+    # Merge stats
+    total_media: int = 0
+    total_overlay: int = 0
+    total_merged: int = 0
+
+    # Mapping stats
+    mapped_by_id: int = 0
+    mapped_by_timestamp: int = 0
+    orphaned: int = 0
+
+    # Timing
+    phase_times: Dict[str, float] = field(default_factory=dict)
 
 def ensure_directory(path: Path) -> None:
     """Ensure directory exists."""
@@ -41,12 +71,36 @@ def save_json(data: Dict[str, Any], path: Path) -> None:
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-def format_timestamp(timestamp_ms: int) -> str:
-    """Convert millisecond timestamp to ISO format."""
-    dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
-    return dt.isoformat().replace('+00:00', 'Z')
-
 def sanitize_filename(filename: str) -> str:
     """Remove invalid characters from filename."""
     import re
     return re.sub(r'[\\/*?:"<>|]', "", filename)[:255]
+
+def safe_materialize(src: Path, dst: Path) -> bool:
+    """
+    Efficiently materialize a file from src to dst.
+    Tries: hardlink -> copy. Returns True on success.
+    """
+    ensure_directory(dst.parent)
+
+    # Don't copy if already exists
+    if dst.exists():
+        return True
+
+    try:
+        # Try hardlink first (instant, no extra space)
+        try:
+            os.link(src, dst)
+            return True
+        except (OSError, NotImplementedError):
+            pass
+
+        # Fallback to copy
+        if src.is_file():
+            shutil.copy2(src, dst)
+        else:
+            shutil.copytree(src, dst)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to materialize {src} to {dst}: {e}")
+        return False
