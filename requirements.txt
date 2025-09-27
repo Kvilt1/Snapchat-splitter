@@ -5,5 +5,8 @@ imageio[ffmpeg]>=2.9.0
 # Image/video processing
 numpy>=1.19.0
 
-# Standard library enhancements
+# Progress bars and UI
+tqdm>=4.65.0
+
+# Standard library enhancements  
 pathlib2>=2.3.5; python_version < '3.4'

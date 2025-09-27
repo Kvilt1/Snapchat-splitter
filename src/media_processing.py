@@ -7,10 +7,8 @@ import os
 import re
 import shutil
 import struct
-import subprocess
 from collections import defaultdict
 from datetime import datetime, timezone
-from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Any
 
@@ -22,68 +20,68 @@ from config import (
     Stats
 )
 
+# Import the optimized overlay kit
+from overlaykit import detect_system_config, overlay_one, overlay_many
+
 logger = logging.getLogger(__name__)
 
-# Global process pool for FFmpeg operations
-_pool = None
+# Global overlay configuration
+_overlay_config = None
 
-def get_process_pool():
-    """Get or create global process pool."""
-    global _pool
-    if _pool is None:
-        _pool = Pool(processes=max(1, cpu_count() - 1))
-    return _pool
+def get_overlay_config():
+    """Get or create global overlay configuration."""
+    global _overlay_config
+    if _overlay_config is None:
+        _overlay_config = detect_system_config()
+        logger.info(f"Detected optimal overlay configuration: hw={_overlay_config.hw}, jobs={_overlay_config.jobs}")
+    return _overlay_config
 
 def cleanup_process_pool():
-    """Close and cleanup process pool."""
-    global _pool
-    if _pool:
-        _pool.close()
-        _pool.join()
-        _pool = None
+    """Cleanup function for compatibility with existing code."""
+    # overlaykit handles its own cleanup, so this is now a no-op
+    pass
 
-def _ffmpeg_worker(args: Tuple[Path, Path, Path]) -> Optional[Tuple[str, Optional[int]]]:
-    """Worker function for FFmpeg merging."""
+def overlay_merge_single(media_file: Path, overlay_file: Path, output_path: Path) -> bool:
+    """
+    Merge media with overlay using overlaykit.
+    Replacement for run_ffmpeg_merge with better error handling and hardware acceleration.
+    """
+    try:
+        ensure_directory(output_path.parent)
+        config = get_overlay_config()
+        
+        # Use overlaykit to perform the merge
+        result_path = overlay_one(
+            str(media_file), 
+            str(overlay_file), 
+            str(output_path.parent),
+            config=config
+        )
+        
+        # overlaykit creates the file with the same name as the input
+        # If the output path is different, we need to rename it
+        expected_output = output_path.parent / media_file.name
+        if expected_output != output_path and expected_output.exists():
+            shutil.move(str(expected_output), str(output_path))
+        
+        # Preserve original timestamps
+        if output_path.exists():
+            st = media_file.stat()
+            os.utime(output_path, (st.st_atime, st.st_mtime))
+            return True
+            
+    except Exception as e:
+        logger.error(f"Overlay merge error for {media_file.name}: {e}")
+        
+    return False
+
+def overlay_worker(args: Tuple[Path, Path, Path]) -> Optional[Tuple[str, Optional[int]]]:
+    """Worker function for overlay merging using overlaykit."""
     media_file, overlay_file, output_path = args
-    if run_ffmpeg_merge(media_file, overlay_file, output_path):
+    if overlay_merge_single(media_file, overlay_file, output_path):
         timestamp = extract_mp4_timestamp(media_file)
         return (media_file.name, timestamp)
     return None
-
-def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_file: Path) -> bool:
-    """Merge media with overlay using FFmpeg."""
-    if not shutil.which("ffmpeg"):
-        return False
-
-    ensure_directory(output_file.parent)
-
-    try:
-        command = [
-            "ffmpeg", "-y",
-            "-i", str(media_file),
-            "-i", str(overlay_file),
-            "-filter_complex",
-            "[1:v][0:v]scale=w=rw:h=rh,format=rgba[ovr];[0:v][ovr]overlay=0:0:format=auto[vout]",
-            "-map", "[vout]",
-            "-map", "0:a?",
-            "-map_metadata", "0",
-            "-movflags", "+faststart",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "18",
-            "-c:a", "copy",
-            str(output_file)
-        ]
-        result = subprocess.run(command, capture_output=True, text=True, timeout=300)
-
-        if result.returncode == 0:
-            # Preserve timestamps
-            st = media_file.stat()
-            os.utime(output_file, (st.st_atime, st.st_mtime))
-            return True
-    except Exception as e:
-        logger.error(f"FFmpeg error for {media_file.name}: {e}")
-    return False
 
 def calculate_file_hash(file_path: Path) -> Optional[str]:
     """Calculate MD5 hash of file."""
@@ -95,7 +93,7 @@ def calculate_file_hash(file_path: Path) -> Optional[str]:
 
 def process_media_group(media_files: List[Path], overlay_files: List[Path],
                        output_dir: Path, group_type: str) -> Tuple[Optional[str], Dict]:
-    """Process a group of media files with overlays."""
+    """Process a group of media files with overlays using overlaykit's optimized processing."""
     stats = {'attempted': len(media_files), 'successful': 0, 'failed': 0}
 
     media_sorted = sorted(media_files, key=lambda x: x.name)
@@ -106,41 +104,77 @@ def process_media_group(media_files: List[Path], overlay_files: List[Path],
 
     try:
         ensure_directory(folder_path)
+        config = get_overlay_config()
 
-        # Build task list
-        tasks = []
-        if len(overlay_files) == 1:
-            # Single overlay for all media
-            for media in media_sorted:
-                tasks.append((media, overlay_files[0], folder_path / media.name))
-        else:
-            # Paired overlays
-            for media, overlay in zip(media_sorted, overlay_sorted):
-                tasks.append((media, overlay, folder_path / media.name))
-
-        logger.info(f"Processing {group_type} group: {folder_name} with {len(tasks)} files")
+        logger.info(f"Processing {group_type} group: {folder_name} with {len(media_files)} files")
 
         timestamps = {}
-        pool = get_process_pool()
-        results = pool.map(_ffmpeg_worker, tasks)
-
-        for result in results:
-            if result:
-                stats['successful'] += 1
-                filename, timestamp = result
-                if timestamp:
-                    dt = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
-                    timestamps[filename] = dt.isoformat().replace('+00:00', 'Z')
-            else:
-                stats['failed'] += 1
+        
+        if len(overlay_files) == 1:
+            # Single overlay for all media - use overlaykit's optimized overlay_many
+            try:
+                media_paths = [str(media) for media in media_sorted]
+                overlay_path = str(overlay_files[0])
+                
+                # Use overlay_many for optimal parallel processing
+                result_paths = overlay_many(
+                    media_paths, 
+                    overlay_path, 
+                    str(folder_path),
+                    config=config
+                )
+                
+                # Process results and extract timestamps
+                for media_file, result_path in zip(media_sorted, result_paths):
+                    if Path(result_path).exists():
+                        stats['successful'] += 1
+                        
+                        # Extract timestamp from original media file
+                        timestamp = extract_mp4_timestamp(media_file)
+                        if timestamp:
+                            dt = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
+                            timestamps[media_file.name] = dt.isoformat().replace('+00:00', 'Z')
+                        
+                        # Preserve original file timestamps
+                        st = media_file.stat()
+                        os.utime(result_path, (st.st_atime, st.st_mtime))
+                    else:
+                        stats['failed'] += 1
+                        
+            except Exception as e:
+                logger.error(f"Error in overlay_many processing: {e}")
+                stats['failed'] = len(media_files)
+        else:
+            # Paired overlays - process individually 
+            for media, overlay in zip(media_sorted, overlay_sorted):
+                try:
+                    output_path = folder_path / media.name
+                    if overlay_merge_single(media, overlay, output_path):
+                        stats['successful'] += 1
+                        
+                        # Extract timestamp from original media file
+                        timestamp = extract_mp4_timestamp(media)
+                        if timestamp:
+                            dt = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
+                            timestamps[media.name] = dt.isoformat().replace('+00:00', 'Z')
+                    else:
+                        stats['failed'] += 1
+                except Exception as e:
+                    logger.error(f"Error processing {media.name}: {e}")
+                    stats['failed'] += 1
 
         if stats['successful'] > 0:
+            # Save timestamps metadata
             with open(folder_path / "timestamps.json", 'w', encoding='utf-8') as f:
                 json.dump(timestamps, f, indent=2)
+            
+            logger.info(f"Successfully processed {stats['successful']}/{stats['attempted']} files in group {folder_name}")
             return folder_name, stats
         else:
+            # Clean up if no files were processed successfully
             if folder_path.exists():
                 shutil.rmtree(folder_path)
+                
     except Exception as e:
         logger.error(f"Error processing {group_type} group: {e}")
         if folder_path.exists():
@@ -149,7 +183,7 @@ def process_media_group(media_files: List[Path], overlay_files: List[Path],
     return None, stats
 
 def merge_overlay_pairs(source_dir: Path, output_dir: Path) -> Tuple[Set[str], Dict[str, Any]]:
-    """Find and merge media/overlay pairs directly to output."""
+    """Find and merge media/overlay pairs using overlaykit's optimized processing."""
     logger.info("=" * 60)
     logger.info("Starting OVERLAY MERGING phase")
     logger.info("=" * 60)
@@ -160,8 +194,12 @@ def merge_overlay_pairs(source_dir: Path, output_dir: Path) -> Tuple[Set[str], D
         'total_merged': 0
     }
 
-    if not shutil.which("ffmpeg"):
-        logger.warning("FFmpeg not found. Skipping overlay merging.")
+    # Check if overlaykit can be used (FFmpeg availability is checked by overlaykit internally)
+    try:
+        config = get_overlay_config()
+        logger.info(f"Using overlaykit with {config.hw} acceleration and {config.jobs} parallel jobs")
+    except Exception as e:
+        logger.warning(f"Could not initialize overlaykit: {e}. Skipping overlay merging.")
         return set(), stats
 
     merged_dir = output_dir / "merged_media"
@@ -193,35 +231,38 @@ def merge_overlay_pairs(source_dir: Path, output_dir: Path) -> Tuple[Set[str], D
     logger.info(f"Found {stats['total_media']} media files and {stats['total_overlay']} overlay files")
 
     merged_files = set()
-    pool = get_process_pool()
 
     for date_str, files in files_by_date.items():
         media_files = files["media"]
         overlay_files = files["overlay"]
 
         if len(media_files) == 1 and len(overlay_files) == 1:
-            # Simple pair
-            output_file = merged_dir / media_files[0].name
-            if run_ffmpeg_merge(media_files[0], overlay_files[0], output_file):
-                merged_files.add(media_files[0].name)
-                merged_files.add(overlay_files[0].name)
-                stats['total_merged'] += 1
+            # Simple pair - use single overlay merge
+            try:
+                output_file = merged_dir / media_files[0].name
+                if overlay_merge_single(media_files[0], overlay_files[0], output_file):
+                    merged_files.add(media_files[0].name)
+                    merged_files.add(overlay_files[0].name)
+                    stats['total_merged'] += 1
+            except Exception as e:
+                logger.error(f"Error merging single pair for {date_str}: {e}")
 
         elif len(overlay_files) > 0 and len(media_files) > 0:
             # Check if overlays are identical (multipart) or different (grouped)
             if len(overlay_files) == 1 or (len(overlay_files) > 1 and
                 len(set(calculate_file_hash(f) for f in overlay_files)) == 1):
-                # Multipart: same overlay for all
+                # Multipart: same overlay for all - use overlaykit's optimized overlay_many
                 folder_name, group_stats = process_media_group(
                     media_files, overlay_files[:1], merged_dir, "multipart"
                 )
             else:
-                # Grouped: different overlays
+                # Grouped: different overlays - process individually
                 folder_name, group_stats = process_media_group(
                     media_files, overlay_files, merged_dir, "grouped"
                 )
 
-            if folder_name:
+            if folder_name and group_stats['successful'] > 0:
+                # Mark all source files as merged
                 for f in media_files + overlay_files:
                     merged_files.add(f.name)
                 stats['total_merged'] += group_stats['successful']
