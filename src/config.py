@@ -8,12 +8,26 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
+import pytz
 
 # Configuration
 INPUT_DIR = Path("input")
 OUTPUT_DIR = Path("output")
 TIMESTAMP_THRESHOLD_SECONDS = 60
 QUICKTIME_EPOCH_ADJUSTER = 2082844800
+
+# Timezone configuration
+FAROESE_TZ = pytz.timezone('Atlantic/Faroe')  # Faroese Atlantic Time (UTC-1/UTC+0 with DST)
+
+# GPU Encoding Configuration (GTX 1070 optimized)
+GPU_ENCODING_ENABLED = True  # Set to False to use CPU encoding
+GPU_PRESET = 'p4'  # p1 (fastest) to p7 (slowest/best quality), p4 is balanced
+GPU_QUALITY = '23'  # Lower = better quality (18-28 recommended)
+GPU_WORKERS = 6  # Auto=6 workers for GTX 1070, or manually set 4-8 based on VRAM usage
+
+# Performance tuning
+USE_FAST_TIMESTAMP_EXTRACTION = True  # Use ffprobe instead of manual parsing
+WEBP_CONVERSION_WORKERS = 8  # For WebP to PNG conversion
 
 # Logging setup
 logging.basicConfig(
@@ -103,3 +117,49 @@ def safe_materialize(src: Path, dst: Path) -> bool:
     except Exception as e:
         logger.error(f"Failed to materialize {src} to {dst}: {e}")
         return False
+
+
+def utc_to_faroese(utc_timestamp_ms: int) -> datetime:
+    """
+    Convert UTC timestamp (milliseconds) to Faroese Atlantic Time.
+    
+    Args:
+        utc_timestamp_ms: UTC timestamp in milliseconds since epoch
+        
+    Returns:
+        datetime object in Faroese timezone
+    """
+    # Convert milliseconds to seconds
+    utc_dt = datetime.fromtimestamp(utc_timestamp_ms / 1000.0, tz=timezone.utc)
+    # Convert to Faroese time
+    faroese_dt = utc_dt.astimezone(FAROESE_TZ)
+    return faroese_dt
+
+
+def format_faroese_timestamp(faroese_dt: datetime) -> str:
+    """
+    Format Faroese datetime with millisecond precision.
+    
+    Args:
+        faroese_dt: datetime in Faroese timezone
+        
+    Returns:
+        String in format: "YYYY-MM-DD HH:MM:SS.mmm Atlantic/Faroe"
+    """
+    # Format with milliseconds
+    ms = faroese_dt.microsecond // 1000
+    return f"{faroese_dt.strftime('%Y-%m-%d %H:%M:%S')}.{ms:03d} Atlantic/Faroe"
+
+
+def get_faroese_date(utc_timestamp_ms: int) -> str:
+    """
+    Get the Faroese date (YYYY-MM-DD) for a UTC timestamp.
+    
+    Args:
+        utc_timestamp_ms: UTC timestamp in milliseconds
+        
+    Returns:
+        Date string in format YYYY-MM-DD (Faroese timezone)
+    """
+    faroese_dt = utc_to_faroese(utc_timestamp_ms)
+    return faroese_dt.strftime('%Y-%m-%d')

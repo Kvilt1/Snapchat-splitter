@@ -9,5 +9,14 @@ numpy>=1.19.0
 # Progress bars and UI
 tqdm>=4.65.0
 
+# System monitoring (for optimal worker calculation)
+psutil>=5.8.0
+
+# Timezone handling
+pytz>=2023.3
+
 # Standard library enhancements  
 pathlib2>=2.3.5; python_version < '3.4'
+
+# Optional: GPU monitoring (uncomment to enable nvidia-smi integration)
+# pynvml>=11.0.0
