@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 
 from config import (
     TIMESTAMP_THRESHOLD_SECONDS,
@@ -23,13 +24,123 @@ from config import (
 
 # Direct ffmpeg-python import for overlay merging
 import ffmpeg
+# PIL for WebP to PNG conversion
+from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+# Cache directory for converted PNG files
+CACHE_DIR = Path(".cache")
+
+def convert_webp_to_png_optimized(input_path: Path, output_path: Path) -> bool:
+    """
+    Convert a single WebP image to PNG efficiently.
+    
+    Args:
+        input_path: Path to input WebP file
+        output_path: Path to output PNG file
+        
+    Returns:
+        bool: True if conversion successful, False otherwise
+    """
+    try:
+        # Skip if PNG already exists and is newer than WebP
+        if (output_path.exists() and 
+            output_path.stat().st_mtime > input_path.stat().st_mtime):
+            return True
+            
+        # Ensure output directory exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Convert WebP to PNG
+        with Image.open(input_path) as img:
+            # Convert to RGB if necessary (for transparency handling)
+            if img.mode in ('RGBA', 'LA'):
+                # Keep transparency
+                img.save(output_path, 'PNG', optimize=True)
+            else:
+                # Convert to RGB for non-transparent images
+                rgb_img = img.convert('RGB')
+                rgb_img.save(output_path, 'PNG', optimize=True)
+                
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to convert {input_path} to PNG: {e}")
+        return False
+
+def batch_convert_webp_worker(args: Tuple[Path, Path]) -> Optional[Tuple[Path, Path]]:
+    """Worker function for parallel WebP to PNG conversion."""
+    webp_path, png_path = args
+    if convert_webp_to_png_optimized(webp_path, png_path):
+        return (webp_path, png_path)
+    return None
+
+def batch_convert_webp_overlays(overlay_files: List[Path], cache_dir: Path, max_workers: int = 8) -> Dict[Path, Path]:
+    """
+    Convert multiple WebP overlay files to PNG in parallel.
+    
+    Args:
+        overlay_files: List of WebP overlay file paths
+        cache_dir: Cache directory for converted PNG files
+        max_workers: Maximum number of worker threads
+        
+    Returns:
+        Dict mapping original WebP paths to converted PNG paths
+    """
+    # Filter only WebP files
+    webp_files = [f for f in overlay_files if f.suffix.lower() == '.webp']
+    
+    if not webp_files:
+        return {}
+        
+    logger.info(f"Converting {len(webp_files)} WebP overlay files to PNG...")
+    
+    # Ensure cache directory exists
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Prepare conversion operations
+    conversion_ops = []
+    path_mapping = {}
+    
+    for webp_path in webp_files:
+        # Create PNG path in cache directory
+        png_filename = webp_path.stem + '.png'
+        png_path = cache_dir / png_filename
+        conversion_ops.append((webp_path, png_path))
+        path_mapping[webp_path] = png_path
+    
+    # Execute conversions in parallel with progress bar
+    successful_conversions = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_op = {executor.submit(batch_convert_webp_worker, op): op for op in conversion_ops}
+        
+        # Progress bar for WebP conversion
+        with tqdm(total=len(conversion_ops), desc="Converting WebP overlays to PNG", unit="files") as pbar:
+            for future in as_completed(future_to_op):
+                result = future.result()
+                if result:
+                    webp_path, png_path = result
+                    successful_conversions[webp_path] = png_path
+                pbar.update(1)
+    
+    logger.info(f"Successfully converted {len(successful_conversions)}/{len(webp_files)} WebP files to PNG")
+    return successful_conversions
+
+def cleanup_cache_directory():
+    """Clean up cache directory to free disk space."""
+    if CACHE_DIR.exists():
+        try:
+            shutil.rmtree(CACHE_DIR)
+            logger.info(f"Cleaned up cache directory: {CACHE_DIR}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up cache directory: {e}")
 
 def cleanup_process_pool():
     """Cleanup function for compatibility with existing code."""
     # No cleanup needed for direct ffmpeg-python usage
-    pass
+    # Clean up cache directory
+    cleanup_cache_directory()
 
 def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path, allow_overwriting: bool = True, quiet: bool = True) -> bool:
     """ Merge media with overlay using direct ffmpeg-python.
@@ -50,18 +161,39 @@ def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path, al
         # Overlay the overlay onto the video
         overlay_video = vid.overlay(scaled, eof_action="repeat")
 
-        # Create output with video and audio, optimized for speed
-        output_node = ffmpeg.output(
-            overlay_video,  # video
-            vid.audio,      # audio
-            str(output_path), # output file
-            # Speed optimizations
-            vcodec="libx264",     # Use x264 for speed
-            preset="ultrafast",   # Fastest encoding preset
-            crf=23,               # Reasonable quality/speed balance
-            # Preserve essential metadata only
-            map_metadata=0,       # Skip faststart for speed (can add later if needed)
-        )
+        # Check if input has audio stream using probe
+        try:
+            probe_result = ffmpeg.probe(str(media_file))
+            has_audio = any(stream['codec_type'] == 'audio' for stream in probe_result['streams'])
+        except:
+            # If probe fails, assume no audio
+            has_audio = False
+        
+        # Create output with or without audio based on input
+        if has_audio:
+            output_node = ffmpeg.output(
+                overlay_video,  # video
+                vid.audio,      # audio
+                str(output_path), # output file
+                # Speed optimizations
+                vcodec="libx264",     # Use x264 for speed
+                preset="ultrafast",   # Fastest encoding preset
+                crf=23,               # Reasonable quality/speed balance
+                # Preserve essential metadata only
+                map_metadata=0,       # Skip faststart for speed (can add later if needed)
+            )
+        else:
+            # Video only output (no audio stream available)
+            output_node = ffmpeg.output(
+                overlay_video,  # video only
+                str(output_path), # output file
+                # Speed optimizations
+                vcodec="libx264",     # Use x264 for speed
+                preset="ultrafast",   # Fastest encoding preset
+                crf=23,               # Reasonable quality/speed balance
+                # Preserve essential metadata only
+                map_metadata=0,       # Skip faststart for speed (can add later if needed)
+            )
 
         if allow_overwriting:
             output_node = output_node.overwrite_output()
@@ -71,7 +203,11 @@ def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path, al
         return True
         
     except ffmpeg.Error as err:
-        logger.error(f"ffmpeg error merging {media_file.name} with overlay {overlay_file.name}: {err}")
+        # Capture both stdout and stderr for better debugging
+        stderr_output = err.stderr.decode('utf-8') if err.stderr else 'No stderr available'
+        logger.error(f"ffmpeg error merging {media_file.name} with overlay {overlay_file.name}:")
+        logger.error(f"  Error message: {err}")
+        logger.error(f"  Stderr output: {stderr_output}")
         return False
         
     except Exception as e:
@@ -124,9 +260,12 @@ def merge_overlay_pairs(source_dir: Path, output_dir: Path, max_workers: int = 8
     merged_dir = output_dir / "merged_media"
     ensure_directory(merged_dir)
     
+    # Setup cache directory for WebP conversion
+    cache_dir = CACHE_DIR / "converted_overlays"
+    
     # Collect all merge operations
     merge_operations = []
-    stats = {'total_media': 0, 'total_overlay': 0, 'total_merged': 0}
+    stats = {'total_media': 0, 'total_overlay': 0, 'total_merged': 0, 'webp_converted': 0}
     
     # Group files by date
     files_by_date = defaultdict(lambda: {"media": [], "overlay": []})
@@ -171,21 +310,44 @@ def merge_overlay_pairs(source_dir: Path, output_dir: Path, max_workers: int = 8
                 merge_operations.append((media, overlay, merged_dir / media.name))
     
     logger.info(f"Found {len(merge_operations)} merge operations to process in parallel")
+    
+    # WEBP CONVERSION PHASE
+    # Extract all unique overlay files that are WebP
+    overlay_files = list(set(op[1] for op in merge_operations))
+    webp_conversion_map = batch_convert_webp_overlays(overlay_files, cache_dir, max_workers)
+    
+    # Update merge operations to use PNG files where available
+    updated_operations = []
+    for media_file, overlay_file, output_file in merge_operations:
+        if overlay_file in webp_conversion_map:
+            # Use converted PNG instead of original WebP
+            updated_operations.append((media_file, webp_conversion_map[overlay_file], output_file))
+            stats['webp_converted'] += 1
+        else:
+            # Use original overlay file
+            updated_operations.append((media_file, overlay_file, output_file))
+    
+    merge_operations = updated_operations
     merged_files = set()
     
-    # Execute operations in parallel
+    # Execute operations in parallel with progress bar
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_op = {executor.submit(parallel_merge_worker, op): op for op in merge_operations}
         
-        for future in as_completed(future_to_op):
-            result = future.result()
-            if result:
-                media_name, overlay_name = result
-                merged_files.add(media_name)
-                merged_files.add(overlay_name)
-                stats['total_merged'] += 1
+        # Progress bar for overlay merging
+        with tqdm(total=len(merge_operations), desc="Merging media with overlays", unit="files") as pbar:
+            for future in as_completed(future_to_op):
+                result = future.result()
+                if result:
+                    media_name, overlay_name = result
+                    merged_files.add(media_name)
+                    merged_files.add(overlay_name)
+                    stats['total_merged'] += 1
+                pbar.update(1)
 
     logger.info(f"Completed {stats['total_merged']}/{len(merge_operations)} merge operations")
+    if stats['webp_converted'] > 0:
+        logger.info(f"Converted {stats['webp_converted']} WebP overlays to PNG for better compatibility")
     logger.info("=" * 60)
     return merged_files, stats
 

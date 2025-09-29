@@ -1,6 +1,7 @@
 # Core dependencies
 ffmpeg-python>=0.2.0
 imageio[ffmpeg]>=2.9.0
+Pillow>=10.0.0
 
 # Image/video processing
 numpy>=1.19.0
