@@ -11,6 +11,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import (
     TIMESTAMP_THRESHOLD_SECONDS,
@@ -30,39 +31,41 @@ def cleanup_process_pool():
     # No cleanup needed for direct ffmpeg-python usage
     pass
 
-def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path, 
-                    allow_overwriting: bool = True, quiet: bool = True) -> bool:
-    """
-    Merge media with overlay using direct ffmpeg-python.
+def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path, allow_overwriting: bool = True, quiet: bool = True) -> bool:
+    """ Merge media with overlay using direct ffmpeg-python.
     Returns True on success, False on failure.
     """
     try:
-        ensure_directory(output_path.parent)
-        
+        # Skip directory check for speed - assume parent exists
         # Create video input
         vid = ffmpeg.input(str(media_file))
-        
+
         # Process with overlay
         overlay_img = ffmpeg.input(str(overlay_file))
+
         # Use scale to scale the overlay to match video height, keeping aspect ratio
         # "rh" means reference height from the main video stream
         scaled = overlay_img.filter("scale", "-1", "rh")
+
         # Overlay the overlay onto the video
         overlay_video = vid.overlay(scaled, eof_action="repeat")
-        
-        # Create output with video and audio, preserving metadata
+
+        # Create output with video and audio, optimized for speed
         output_node = ffmpeg.output(
             overlay_video,  # video
             vid.audio,      # audio
-            str(output_path),  # output file
-            # Preserve all metadata from input streams
-            map_metadata=0,  # Copy metadata from input stream 0 (the video)
-            movflags="+faststart"  # Move moov atom to beginning for faster loading
+            str(output_path), # output file
+            # Speed optimizations
+            vcodec="libx264",     # Use x264 for speed
+            preset="ultrafast",   # Fastest encoding preset
+            crf=23,               # Reasonable quality/speed balance
+            # Preserve essential metadata only
+            map_metadata=0,       # Skip faststart for speed (can add later if needed)
         )
-        
+
         if allow_overwriting:
             output_node = output_node.overwrite_output()
-        
+
         # Run the conversion
         output_node.run(quiet=quiet)
         return True
@@ -70,6 +73,7 @@ def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path,
     except ffmpeg.Error as err:
         logger.error(f"ffmpeg error merging {media_file.name} with overlay {overlay_file.name}: {err}")
         return False
+        
     except Exception as e:
         logger.error(f"Error merging {media_file.name} with overlay {overlay_file.name}: {e}")
         return False
@@ -77,15 +81,9 @@ def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path,
 def overlay_merge_single(media_file: Path, overlay_file: Path, output_path: Path) -> bool:
     """
     Merge media with overlay using direct ffmpeg-python.
-    Wrapper for run_ffmpeg_merge that preserves original file timestamps.
+    Optimized for speed - skips timestamp preservation.
     """
-    if run_ffmpeg_merge(media_file, overlay_file, output_path):
-        # Preserve original timestamps
-        if output_path.exists():
-            st = media_file.stat()
-            os.utime(output_path, (st.st_atime, st.st_mtime))
-        return True
-    return False
+    return run_ffmpeg_merge(media_file, overlay_file, output_path)
 
 def overlay_worker(args: Tuple[Path, Path, Path]) -> Optional[Tuple[str, Optional[int]]]:
     """Worker function for overlay merging using direct ffmpeg-python."""
@@ -104,103 +102,91 @@ def calculate_file_hash(file_path: Path) -> Optional[str]:
         return None
 
 
-def merge_overlay_pairs(source_dir: Path, output_dir: Path) -> Tuple[Set[str], Dict[str, Any]]:
-    """Find and merge media/overlay pairs using direct ffmpeg-python processing."""
-    logger.info("=" * 60)
-    logger.info("Starting OVERLAY MERGING phase")
-    logger.info("=" * 60)
+def parallel_merge_worker(args: Tuple[Path, Path, Path]) -> Optional[Tuple[str, str]]:
+    """Worker function for parallel overlay merging."""
+    media_file, overlay_file, output_file = args
+    
+    # Skip if output already exists and is newer than inputs
+    if (output_file.exists() and 
+        output_file.stat().st_mtime > max(media_file.stat().st_mtime, overlay_file.stat().st_mtime)):
+        return (media_file.name, overlay_file.name)  # Already merged
+    
+    if overlay_merge_single(media_file, overlay_file, output_file):
+        return (media_file.name, overlay_file.name)
+    return None
 
-    stats = {
-        'total_media': 0,
-        'total_overlay': 0,
-        'total_merged': 0
-    }
+def merge_overlay_pairs(source_dir: Path, output_dir: Path, max_workers: int = 8) -> Tuple[Set[str], Dict[str, Any]]:
+    """Find and merge media/overlay pairs using parallel processing."""
+    logger.info("=" * 60)
+    logger.info("Starting PARALLEL OVERLAY MERGING phase")
+    logger.info("=" * 60)
 
     merged_dir = output_dir / "merged_media"
     ensure_directory(merged_dir)
-
+    
+    # Collect all merge operations
+    merge_operations = []
+    stats = {'total_media': 0, 'total_overlay': 0, 'total_merged': 0}
+    
     # Group files by date
     files_by_date = defaultdict(lambda: {"media": [], "overlay": []})
     for file_path in source_dir.iterdir():
         if not file_path.is_file():
             continue
-
+        
         match = re.match(r"(\d{4}-\d{2}-\d{2})", file_path.name)
         if not match:
             continue
-
+            
         date_str = match.group(1)
         name_lower = file_path.name.lower()
-
+        
         if "thumbnail" in name_lower or "media~zip-" in file_path.name:
             continue
-
+            
         if "_media~" in file_path.name:
             files_by_date[date_str]["media"].append(file_path)
             stats['total_media'] += 1
         elif "_overlay~" in file_path.name:
             files_by_date[date_str]["overlay"].append(file_path)
             stats['total_overlay'] += 1
-
-    logger.info(f"Found {stats['total_media']} media files and {stats['total_overlay']} overlay files")
-
-    merged_files = set()
-
+    
+    # Collect all merge operations from all groups
     for date_str, files in files_by_date.items():
-        media_files = files["media"]
-        overlay_files = files["overlay"]
-
-        if len(media_files) == 1 and len(overlay_files) == 1:
-            # Simple pair - merge directly
-            try:
-                output_file = merged_dir / media_files[0].name
-                if overlay_merge_single(media_files[0], overlay_files[0], output_file):
-                    merged_files.add(media_files[0].name)
-                    merged_files.add(overlay_files[0].name)
-                    stats['total_merged'] += 1
-            except Exception as e:
-                logger.error(f"Error merging single pair for {date_str}: {e}")
-
-        elif len(overlay_files) > 0 and len(media_files) > 0:
-            # Handle grouped media individually
-            media_sorted = sorted(media_files, key=lambda x: x.name)
-            overlay_sorted = sorted(overlay_files, key=lambda x: x.name)
+        media_files = sorted(files["media"], key=lambda x: x.name)
+        overlay_files = sorted(files["overlay"], key=lambda x: x.name)
+        
+        if not media_files or not overlay_files:
+            continue
             
-            # Check if overlays are identical (multipart) or different (grouped)
-            if len(overlay_files) == 1 or (len(overlay_files) > 1 and
-                len(set(calculate_file_hash(f) for f in overlay_files)) == 1):
-                # Multipart: same overlay for all media files
-                overlay = overlay_files[0]  # Use the first (and same) overlay
-                logger.info(f"Processing multipart group for {date_str}: {len(media_files)} files with same overlay")
-                
-                for media_file in media_sorted:
-                    try:
-                        output_file = merged_dir / media_file.name
-                        if overlay_merge_single(media_file, overlay, output_file):
-                            merged_files.add(media_file.name)
-                            stats['total_merged'] += 1
-                    except Exception as e:
-                        logger.error(f"Error merging {media_file.name}: {e}")
-                
-                # Mark overlay as merged
-                merged_files.add(overlay.name)
-            else:
-                # Grouped: different overlays - pair them individually
-                logger.info(f"Processing grouped files for {date_str}: {len(media_files)} media with {len(overlay_files)} overlays")
-                
-                for media, overlay in zip(media_sorted, overlay_sorted):
-                    try:
-                        output_file = merged_dir / media.name
-                        if overlay_merge_single(media, overlay, output_file):
-                            merged_files.add(media.name)
-                            merged_files.add(overlay.name)
-                            stats['total_merged'] += 1
-                    except Exception as e:
-                        logger.error(f"Error merging {media.name}: {e}")
+        if len(overlay_files) == 1 or (len(overlay_files) > 1 and 
+            len(set(calculate_file_hash(f) for f in overlay_files)) == 1):
+            # Single/multipart: use first overlay for all media
+            overlay = overlay_files[0]
+            for media in media_files:
+                merge_operations.append((media, overlay, merged_dir / media.name))
+        else:
+            # Grouped: pair each media with its overlay
+            for media, overlay in zip(media_files, overlay_files):
+                merge_operations.append((media, overlay, merged_dir / media.name))
+    
+    logger.info(f"Found {len(merge_operations)} merge operations to process in parallel")
+    merged_files = set()
+    
+    # Execute operations in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_op = {executor.submit(parallel_merge_worker, op): op for op in merge_operations}
+        
+        for future in as_completed(future_to_op):
+            result = future.result()
+            if result:
+                media_name, overlay_name = result
+                merged_files.add(media_name)
+                merged_files.add(overlay_name)
+                stats['total_merged'] += 1
 
-    logger.info(f"Total merged operations: {stats['total_merged']}")
+    logger.info(f"Completed {stats['total_merged']}/{len(merge_operations)} merge operations")
     logger.info("=" * 60)
-
     return merged_files, stats
 
 def extract_media_id(filename: str) -> Optional[str]:
