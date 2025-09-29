@@ -66,29 +66,16 @@ def process_conversation_media(conv_id: str, messages: list, mapping: dict,
             media_file = item["media_file"]
             dest = media_dir / media_file.filename
 
-            # Materialize the file or folder from its source
-            if media_file.is_grouped:
-                # Handle grouped folder - copy entire directory
-                ensure_directory(dest)
-                for f in media_file.source_path.iterdir():
-                    if f.is_file():
-                        safe_materialize(f, dest / f.name)
-                        if f.name != "timestamps.json":
-                            matched_files.append(f.name)
-                # Add location reference with trailing slash for folder
-                location = f"media/{media_file.filename}/"
-            else:
-                # Handle single file
-                if safe_materialize(media_file.source_path, dest):
-                    matched_files.append(media_file.filename)
-                location = f"media/{media_file.filename}"
-
+            # Handle single file
+            if safe_materialize(media_file.source_path, dest):
+                matched_files.append(media_file.filename)
+            location = f"media/{media_file.filename}"
             media_locations.append(location)
 
         # Update message
         messages[msg_idx]["media_locations"] = media_locations
         messages[msg_idx]["matched_media_files"] = matched_files
-        messages[msg_idx]["is_grouped"] = items[0]["media_file"].is_grouped
+        messages[msg_idx]["is_grouped"] = False  # All files are now individual
         messages[msg_idx]["mapping_method"] = items[0]["mapping_method"]
 
         if "time_diff_seconds" in items[0]:

@@ -30,7 +30,6 @@ class MediaFile:
     media_id: Optional[str] = None
     timestamp: Optional[int] = None
     is_merged: bool = False
-    is_grouped: bool = False
     mapping_method: Optional[str] = None
 
 @dataclass

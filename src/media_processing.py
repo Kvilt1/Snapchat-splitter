@@ -20,63 +20,77 @@ from config import (
     Stats
 )
 
-# Import the optimized overlay kit
-from overlaykit import detect_system_config, overlay_one, overlay_many
+# Direct ffmpeg-python import for overlay merging
+import ffmpeg
 
 logger = logging.getLogger(__name__)
 
-# Global overlay configuration
-_overlay_config = None
-
-def get_overlay_config():
-    """Get or create global overlay configuration."""
-    global _overlay_config
-    if _overlay_config is None:
-        _overlay_config = detect_system_config()
-        logger.info(f"Detected optimal overlay configuration: hw={_overlay_config.hw}, jobs={_overlay_config.jobs}")
-    return _overlay_config
-
 def cleanup_process_pool():
     """Cleanup function for compatibility with existing code."""
-    # overlaykit handles its own cleanup, so this is now a no-op
+    # No cleanup needed for direct ffmpeg-python usage
     pass
 
-def overlay_merge_single(media_file: Path, overlay_file: Path, output_path: Path) -> bool:
+def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path, 
+                    allow_overwriting: bool = True, quiet: bool = True) -> bool:
     """
-    Merge media with overlay using overlaykit.
-    Replacement for run_ffmpeg_merge with better error handling and hardware acceleration.
+    Merge media with overlay using direct ffmpeg-python.
+    Returns True on success, False on failure.
     """
     try:
         ensure_directory(output_path.parent)
-        config = get_overlay_config()
         
-        # Use overlaykit to perform the merge
-        result_path = overlay_one(
-            str(media_file), 
-            str(overlay_file), 
-            str(output_path.parent),
-            config=config
+        # Create video input
+        vid = ffmpeg.input(str(media_file))
+        
+        # Process with overlay
+        overlay_img = ffmpeg.input(str(overlay_file))
+        # Use scale to scale the overlay to match video height, keeping aspect ratio
+        # "rh" means reference height from the main video stream
+        scaled = overlay_img.filter("scale", "-1", "rh")
+        # Overlay the overlay onto the video
+        overlay_video = vid.overlay(scaled, eof_action="repeat")
+        
+        # Create output with video and audio, preserving metadata
+        output_node = ffmpeg.output(
+            overlay_video,  # video
+            vid.audio,      # audio
+            str(output_path),  # output file
+            # Preserve all metadata from input streams
+            map_metadata=0,  # Copy metadata from input stream 0 (the video)
+            movflags="+faststart"  # Move moov atom to beginning for faster loading
         )
         
-        # overlaykit creates the file with the same name as the input
-        # If the output path is different, we need to rename it
-        expected_output = output_path.parent / media_file.name
-        if expected_output != output_path and expected_output.exists():
-            shutil.move(str(expected_output), str(output_path))
+        if allow_overwriting:
+            output_node = output_node.overwrite_output()
+            
+        logger.debug(f"Running ffmpeg merge: {media_file.name} + {overlay_file.name} -> {output_path.name}")
         
+        # Run the conversion
+        output_node.run(quiet=quiet)
+        return True
+        
+    except ffmpeg.Error as err:
+        logger.error(f"ffmpeg error merging {media_file.name} with overlay {overlay_file.name}: {err}")
+        return False
+    except Exception as e:
+        logger.error(f"Error merging {media_file.name} with overlay {overlay_file.name}: {e}")
+        return False
+
+def overlay_merge_single(media_file: Path, overlay_file: Path, output_path: Path) -> bool:
+    """
+    Merge media with overlay using direct ffmpeg-python.
+    Wrapper for run_ffmpeg_merge that preserves original file timestamps.
+    """
+    if run_ffmpeg_merge(media_file, overlay_file, output_path):
         # Preserve original timestamps
         if output_path.exists():
             st = media_file.stat()
             os.utime(output_path, (st.st_atime, st.st_mtime))
-            return True
-            
-    except Exception as e:
-        logger.error(f"Overlay merge error for {media_file.name}: {e}")
-        
+        return True
     return False
 
 def overlay_worker(args: Tuple[Path, Path, Path]) -> Optional[Tuple[str, Optional[int]]]:
-    """Worker function for overlay merging using overlaykit."""
+    """Worker function for overlay merging using direct ffmpeg-python."""
     media_file, overlay_file, output_path = args
     if overlay_merge_single(media_file, overlay_file, output_path):
         timestamp = extract_mp4_timestamp(media_file)
@@ -91,99 +105,9 @@ def calculate_file_hash(file_path: Path) -> Optional[str]:
     except Exception:
         return None
 
-def process_media_group(media_files: List[Path], overlay_files: List[Path],
-                       output_dir: Path, group_type: str) -> Tuple[Optional[str], Dict]:
-    """Process a group of media files with overlays using overlaykit's optimized processing."""
-    stats = {'attempted': len(media_files), 'successful': 0, 'failed': 0}
-
-    media_sorted = sorted(media_files, key=lambda x: x.name)
-    overlay_sorted = sorted(overlay_files, key=lambda x: x.name) if len(overlay_files) > 1 else overlay_files
-
-    folder_name = f"{media_sorted[-1].stem}_{group_type}"
-    folder_path = output_dir / folder_name
-
-    try:
-        ensure_directory(folder_path)
-        config = get_overlay_config()
-
-        logger.info(f"Processing {group_type} group: {folder_name} with {len(media_files)} files")
-
-        timestamps = {}
-        
-        if len(overlay_files) == 1:
-            # Single overlay for all media - use overlaykit's optimized overlay_many
-            try:
-                media_paths = [str(media) for media in media_sorted]
-                overlay_path = str(overlay_files[0])
-                
-                # Use overlay_many for optimal parallel processing
-                result_paths = overlay_many(
-                    media_paths, 
-                    overlay_path, 
-                    str(folder_path),
-                    config=config
-                )
-                
-                # Process results and extract timestamps
-                for media_file, result_path in zip(media_sorted, result_paths):
-                    if Path(result_path).exists():
-                        stats['successful'] += 1
-                        
-                        # Extract timestamp from original media file
-                        timestamp = extract_mp4_timestamp(media_file)
-                        if timestamp:
-                            dt = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
-                            timestamps[media_file.name] = dt.isoformat().replace('+00:00', 'Z')
-                        
-                        # Preserve original file timestamps
-                        st = media_file.stat()
-                        os.utime(result_path, (st.st_atime, st.st_mtime))
-                    else:
-                        stats['failed'] += 1
-                        
-            except Exception as e:
-                logger.error(f"Error in overlay_many processing: {e}")
-                stats['failed'] = len(media_files)
-        else:
-            # Paired overlays - process individually 
-            for media, overlay in zip(media_sorted, overlay_sorted):
-                try:
-                    output_path = folder_path / media.name
-                    if overlay_merge_single(media, overlay, output_path):
-                        stats['successful'] += 1
-                        
-                        # Extract timestamp from original media file
-                        timestamp = extract_mp4_timestamp(media)
-                        if timestamp:
-                            dt = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
-                            timestamps[media.name] = dt.isoformat().replace('+00:00', 'Z')
-                    else:
-                        stats['failed'] += 1
-                except Exception as e:
-                    logger.error(f"Error processing {media.name}: {e}")
-                    stats['failed'] += 1
-
-        if stats['successful'] > 0:
-            # Save timestamps metadata
-            with open(folder_path / "timestamps.json", 'w', encoding='utf-8') as f:
-                json.dump(timestamps, f, indent=2)
-            
-            logger.info(f"Successfully processed {stats['successful']}/{stats['attempted']} files in group {folder_name}")
-            return folder_name, stats
-        else:
-            # Clean up if no files were processed successfully
-            if folder_path.exists():
-                shutil.rmtree(folder_path)
-                
-    except Exception as e:
-        logger.error(f"Error processing {group_type} group: {e}")
-        if folder_path.exists():
-            shutil.rmtree(folder_path)
-
-    return None, stats
 
 def merge_overlay_pairs(source_dir: Path, output_dir: Path) -> Tuple[Set[str], Dict[str, Any]]:
-    """Find and merge media/overlay pairs using overlaykit's optimized processing."""
+    """Find and merge media/overlay pairs using direct ffmpeg-python processing."""
     logger.info("=" * 60)
     logger.info("Starting OVERLAY MERGING phase")
     logger.info("=" * 60)
@@ -193,14 +117,6 @@ def merge_overlay_pairs(source_dir: Path, output_dir: Path) -> Tuple[Set[str], D
         'total_overlay': 0,
         'total_merged': 0
     }
-
-    # Check if overlaykit can be used (FFmpeg availability is checked by overlaykit internally)
-    try:
-        config = get_overlay_config()
-        logger.info(f"Using overlaykit with {config.hw} acceleration and {config.jobs} parallel jobs")
-    except Exception as e:
-        logger.warning(f"Could not initialize overlaykit: {e}. Skipping overlay merging.")
-        return set(), stats
 
     merged_dir = output_dir / "merged_media"
     ensure_directory(merged_dir)
@@ -237,7 +153,7 @@ def merge_overlay_pairs(source_dir: Path, output_dir: Path) -> Tuple[Set[str], D
         overlay_files = files["overlay"]
 
         if len(media_files) == 1 and len(overlay_files) == 1:
-            # Simple pair - use single overlay merge
+            # Simple pair - merge directly
             try:
                 output_file = merged_dir / media_files[0].name
                 if overlay_merge_single(media_files[0], overlay_files[0], output_file):
@@ -248,24 +164,41 @@ def merge_overlay_pairs(source_dir: Path, output_dir: Path) -> Tuple[Set[str], D
                 logger.error(f"Error merging single pair for {date_str}: {e}")
 
         elif len(overlay_files) > 0 and len(media_files) > 0:
+            # Handle grouped media individually
+            media_sorted = sorted(media_files, key=lambda x: x.name)
+            overlay_sorted = sorted(overlay_files, key=lambda x: x.name)
+            
             # Check if overlays are identical (multipart) or different (grouped)
             if len(overlay_files) == 1 or (len(overlay_files) > 1 and
                 len(set(calculate_file_hash(f) for f in overlay_files)) == 1):
-                # Multipart: same overlay for all - use overlaykit's optimized overlay_many
-                folder_name, group_stats = process_media_group(
-                    media_files, overlay_files[:1], merged_dir, "multipart"
-                )
+                # Multipart: same overlay for all media files
+                overlay = overlay_files[0]  # Use the first (and same) overlay
+                logger.info(f"Processing multipart group for {date_str}: {len(media_files)} files with same overlay")
+                
+                for media_file in media_sorted:
+                    try:
+                        output_file = merged_dir / media_file.name
+                        if overlay_merge_single(media_file, overlay, output_file):
+                            merged_files.add(media_file.name)
+                            stats['total_merged'] += 1
+                    except Exception as e:
+                        logger.error(f"Error merging {media_file.name}: {e}")
+                
+                # Mark overlay as merged
+                merged_files.add(overlay.name)
             else:
-                # Grouped: different overlays - process individually
-                folder_name, group_stats = process_media_group(
-                    media_files, overlay_files, merged_dir, "grouped"
-                )
-
-            if folder_name and group_stats['successful'] > 0:
-                # Mark all source files as merged
-                for f in media_files + overlay_files:
-                    merged_files.add(f.name)
-                stats['total_merged'] += group_stats['successful']
+                # Grouped: different overlays - pair them individually
+                logger.info(f"Processing grouped files for {date_str}: {len(media_files)} media with {len(overlay_files)} overlays")
+                
+                for media, overlay in zip(media_sorted, overlay_sorted):
+                    try:
+                        output_file = merged_dir / media.name
+                        if overlay_merge_single(media, overlay, output_file):
+                            merged_files.add(media.name)
+                            merged_files.add(overlay.name)
+                            stats['total_merged'] += 1
+                    except Exception as e:
+                        logger.error(f"Error merging {media.name}: {e}")
 
     logger.info(f"Total merged operations: {stats['total_merged']}")
     logger.info("=" * 60)
@@ -320,7 +253,7 @@ def index_media_files(source_dir: Path, merged_dir: Optional[Path] = None) -> Tu
             media_index[media_id] = media_file
             stats['extracted_ids'] += 1
 
-    # Index merged files
+    # Index merged files - these take precedence over source files
     if merged_dir and merged_dir.exists():
         for item in merged_dir.iterdir():
             if item.is_file():
@@ -336,35 +269,8 @@ def index_media_files(source_dir: Path, merged_dir: Optional[Path] = None) -> Tu
                 )
 
                 if media_id:
-                    media_index[media_id] = media_file
+                    media_index[media_id] = media_file  # Merged files take precedence
                     stats['extracted_ids'] += 1
-
-            elif item.is_dir() and (item.name.endswith("_multipart") or item.name.endswith("_grouped")):
-                # Index grouped folders - create one MediaFile for the folder
-                # Map all media IDs in the folder to the same MediaFile
-                media_file = MediaFile(
-                    filename=item.name,  # Use folder name
-                    source_path=item,     # Point to folder
-                    media_id=None,  # Will be set from first file
-                    is_merged=True,
-                    is_grouped=True
-                )
-
-                folder_indexed = False
-                for file_path in item.iterdir():
-                    if file_path.suffix.lower() == '.mp4':
-                        media_id = extract_media_id(file_path.name)
-
-                        if media_id:
-                            if not folder_indexed:
-                                stats['total_files'] += 1
-                                media_file.media_id = media_id  # Set primary media ID
-                                folder_indexed = True
-                                logger.debug(f"Indexed grouped folder: {item.name} with primary ID {media_id}")
-
-                            # Map this media ID to the folder
-                            media_index[media_id] = media_file
-                            stats['extracted_ids'] += 1
 
     logger.info(f"Indexed {stats['total_files']} files, extracted {stats['extracted_ids']} IDs")
     logger.info("=" * 60)
@@ -412,7 +318,7 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
 
     mappings = defaultdict(dict)
     mapped_files = set()
-    stats = {'mapped_by_id': 0, 'mapped_by_timestamp': 0}
+    stats = {'mapped_by_id': 0, 'mapped_by_timestamp': 0, 'merged_mapped': 0}
 
     # Phase 1: Map by Media ID
     logger.info("Phase 1: Mapping by Media ID...")
@@ -436,6 +342,12 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
                     })
                     mapped_files.add(media_file.filename)
                     stats['mapped_by_id'] += 1
+                    
+                    if media_file.is_merged:
+                        stats['merged_mapped'] += 1
+                        logger.debug(f"Mapped merged file {media_file.filename} to message via media_id {media_id}")
+                else:
+                    logger.debug(f"Media ID {media_id} not found in index")
 
     # Phase 2: Map unmapped files by timestamp
     logger.info("Phase 2: Mapping by timestamp...")
@@ -454,22 +366,6 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
         if media_file.filename in mapped_files:
             continue
 
-        # For grouped folders, read the earliest timestamp from timestamps.json
-        if media_file.is_grouped:
-            timestamps_file = media_file.source_path / "timestamps.json"
-            if timestamps_file.exists():
-                import json
-                from datetime import datetime
-                with open(timestamps_file) as f:
-                    timestamps_data = json.load(f)
-                    # Find the earliest timestamp
-                    min_timestamp = None
-                    for iso_ts in timestamps_data.values():
-                        dt = datetime.fromisoformat(iso_ts.replace('Z', '+00:00'))
-                        ts_ms = int(dt.timestamp() * 1000)
-                        if min_timestamp is None or ts_ms < min_timestamp:
-                            min_timestamp = ts_ms
-                    media_file.timestamp = min_timestamp
 
         if not media_file.timestamp:
             continue
@@ -488,22 +384,17 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
             if msg_idx not in mappings[conv_id]:
                 mappings[conv_id][msg_idx] = []
 
-            # Check if this is a duplicate grouped folder mapping
-            already_mapped = False
-            if media_file.is_grouped:
-                for existing_item in mappings[conv_id][msg_idx]:
-                    if existing_item["media_file"].filename == media_file.filename:
-                        already_mapped = True
-                        break
-
-            if not already_mapped:
-                mappings[conv_id][msg_idx].append({
-                    "media_file": media_file,
-                    "mapping_method": "timestamp",
-                    "time_diff_seconds": round(min_diff / 1000.0, 1)
-                })
-                mapped_files.add(media_file.filename)
-                stats['mapped_by_timestamp'] += 1
+            mappings[conv_id][msg_idx].append({
+                "media_file": media_file,
+                "mapping_method": "timestamp",
+                "time_diff_seconds": round(min_diff / 1000.0, 1)
+            })
+            mapped_files.add(media_file.filename)
+            stats['mapped_by_timestamp'] += 1
+            
+            if media_file.is_merged:
+                stats['merged_mapped'] += 1
+                logger.debug(f"Mapped merged file {media_file.filename} to message via timestamp")
 
     logger.info(f"Mapped {stats['mapped_by_id']} by ID, {stats['mapped_by_timestamp']} by timestamp")
     logger.info("=" * 60)
