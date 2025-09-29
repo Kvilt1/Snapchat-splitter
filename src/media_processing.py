@@ -464,7 +464,7 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
 
     mappings = defaultdict(dict)
     mapped_files = set()
-    stats = {'mapped_by_id': 0, 'mapped_by_timestamp': 0}
+    stats = {'mapped_by_id': 0, 'mapped_by_timestamp': 0, 'fallback_snap_used': 0}
 
     # Phase 1: Map by Media ID
     logger.info("Phase 1: Mapping by Media ID...")
@@ -474,8 +474,14 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
             if not media_ids_str:
                 continue
 
-            for media_id in media_ids_str.split('|'):
-                media_id = media_id.strip()
+            media_ids = [mid.strip() for mid in media_ids_str.split('|')]
+            msg_type = msg.get("Type", "")
+            
+            # For snap messages, only map the first Media ID
+            if msg_type == "snap":
+                media_ids = media_ids[:1]
+
+            for media_id in media_ids:
                 if media_id in media_index:
                     media_file = media_index[media_id]
 
@@ -506,18 +512,59 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
         if media_file.filename in mapped_files:
             continue
 
-
         if not media_file.timestamp:
             continue
 
-        best_match = None
-        min_diff = float('inf')
-
+        # Find all potential matches within threshold
+        potential_matches = []
         for conv_id, msg_idx, msg_ts in msg_timestamps:
             diff = abs(media_file.timestamp - msg_ts)
-            if diff < min_diff:
-                min_diff = diff
+            if diff <= TIMESTAMP_THRESHOLD_SECONDS * 1000:
+                potential_matches.append((conv_id, msg_idx, msg_ts, diff))
+        
+        # Sort by timestamp difference
+        potential_matches.sort(key=lambda x: x[3])
+        
+        best_match = None
+        min_diff = float('inf')
+        fallback_match = None  # For locked snaps as last resort
+        fallback_diff = float('inf')
+        
+        # Find the best available match (prioritize empty snaps)
+        for conv_id, msg_idx, msg_ts, diff in potential_matches:
+            # Get the actual message to check its type
+            if conv_id in conversations and msg_idx < len(conversations[conv_id]):
+                msg = conversations[conv_id][msg_idx]
+                msg_type = msg.get("Type", "")
+                
+                # For snap messages, check if already has media mapped
+                if msg_type == "snap":
+                    if msg_idx in mappings[conv_id] and len(mappings[conv_id][msg_idx]) > 0:
+                        # This snap already has media - keep as fallback if no empty snaps found
+                        if fallback_match is None or diff < fallback_diff:
+                            fallback_match = (conv_id, msg_idx)
+                            fallback_diff = diff
+                        continue
+                
+                # This is a valid match (empty message or non-snap)
                 best_match = (conv_id, msg_idx)
+                min_diff = diff
+                break
+        
+        # If no available match found, check if we can use a locked snap to prevent orphaning
+        if not best_match and fallback_match:
+            conv_id, msg_idx = fallback_match
+            # Only use fallback if it's a snap and would prevent orphaning
+            if (conv_id in conversations and msg_idx < len(conversations[conv_id]) and
+                conversations[conv_id][msg_idx].get("Type") == "snap"):
+                best_match = fallback_match
+                min_diff = fallback_diff
+                logger.debug(f"Using locked snap as fallback for {media_file.filename} to prevent orphaning")
+            
+        # If using fallback, log this for transparency
+        if best_match and fallback_match and best_match == fallback_match:
+            logger.debug(f"Media {media_file.filename} added to already-occupied snap to prevent orphaning")
+            stats['fallback_snap_used'] += 1
 
         if best_match and min_diff <= TIMESTAMP_THRESHOLD_SECONDS * 1000:
             conv_id, msg_idx = best_match
@@ -533,6 +580,8 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
             stats['mapped_by_timestamp'] += 1
 
     logger.info(f"Mapped {stats['mapped_by_id']} by ID, {stats['mapped_by_timestamp']} by timestamp")
+    if stats['fallback_snap_used'] > 0:
+        logger.info(f"Used {stats['fallback_snap_used']} fallback mappings (2nd media on snap to prevent orphaning)")
     logger.info("=" * 60)
 
     return mappings, mapped_files, stats
