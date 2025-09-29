@@ -3,5 +3,6 @@ input/
 output/
 
 src/__pycache__
+src/snap_mapper/__pycache__
 nul
 validate_parity.py
