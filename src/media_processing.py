@@ -62,8 +62,6 @@ def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path,
         
         if allow_overwriting:
             output_node = output_node.overwrite_output()
-            
-        logger.debug(f"Running ffmpeg merge: {media_file.name} + {overlay_file.name} -> {output_path.name}")
         
         # Run the conversion
         output_node.run(quiet=quiet)
@@ -318,7 +316,7 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
 
     mappings = defaultdict(dict)
     mapped_files = set()
-    stats = {'mapped_by_id': 0, 'mapped_by_timestamp': 0, 'merged_mapped': 0}
+    stats = {'mapped_by_id': 0, 'mapped_by_timestamp': 0}
 
     # Phase 1: Map by Media ID
     logger.info("Phase 1: Mapping by Media ID...")
@@ -342,12 +340,6 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
                     })
                     mapped_files.add(media_file.filename)
                     stats['mapped_by_id'] += 1
-                    
-                    if media_file.is_merged:
-                        stats['merged_mapped'] += 1
-                        logger.debug(f"Mapped merged file {media_file.filename} to message via media_id {media_id}")
-                else:
-                    logger.debug(f"Media ID {media_id} not found in index")
 
     # Phase 2: Map unmapped files by timestamp
     logger.info("Phase 2: Mapping by timestamp...")
@@ -391,10 +383,6 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
             })
             mapped_files.add(media_file.filename)
             stats['mapped_by_timestamp'] += 1
-            
-            if media_file.is_merged:
-                stats['merged_mapped'] += 1
-                logger.debug(f"Mapped merged file {media_file.filename} to message via timestamp")
 
     logger.info(f"Mapped {stats['mapped_by_id']} by ID, {stats['mapped_by_timestamp']} by timestamp")
     logger.info("=" * 60)
