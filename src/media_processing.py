@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Any
 
+import ffmpeg
+
 from config import (
     TIMESTAMP_THRESHOLD_SECONDS,
     QUICKTIME_EPOCH_ADJUSTER,
@@ -20,66 +22,66 @@ from config import (
     Stats
 )
 
-# Import the optimized overlay kit
-from overlaykit import detect_system_config, overlay_one, overlay_many
-
 logger = logging.getLogger(__name__)
-
-# Global overlay configuration
-_overlay_config = None
-
-def get_overlay_config():
-    """Get or create global overlay configuration."""
-    global _overlay_config
-    if _overlay_config is None:
-        _overlay_config = detect_system_config()
-        logger.info(f"Detected optimal overlay configuration: hw={_overlay_config.hw}, jobs={_overlay_config.jobs}")
-    return _overlay_config
 
 def cleanup_process_pool():
     """Cleanup function for compatibility with existing code."""
-    # overlaykit handles its own cleanup, so this is now a no-op
     pass
+
+def has_audio(filename: str) -> bool:
+    """Check if a media file has an audio stream."""
+    try:
+        probe = ffmpeg.probe(filename)
+        return any(stream['codec_type'] == 'audio' for stream in probe['streams'])
+    except ffmpeg.Error:
+        return False
 
 def overlay_merge_single(media_file: Path, overlay_file: Path, output_path: Path) -> bool:
     """
-    Merge media with overlay using overlaykit.
-    Replacement for run_ffmpeg_merge with better error handling and hardware acceleration.
+    Merge media with overlay using a simple ffmpeg-python implementation.
     """
     try:
         ensure_directory(output_path.parent)
-        config = get_overlay_config()
-        
-        # Use overlaykit to perform the merge
-        result_path = overlay_one(
-            str(media_file), 
-            str(overlay_file), 
-            str(output_path.parent),
-            config=config
-        )
-        
-        # overlaykit creates the file with the same name as the input
-        # If the output path is different, we need to rename it
-        expected_output = output_path.parent / media_file.name
-        if expected_output != output_path and expected_output.exists():
-            shutil.move(str(expected_output), str(output_path))
-        
+
+        vid = ffmpeg.input(str(media_file))
+        overlay_img = ffmpeg.input(str(overlay_file))
+
+        # Scale the overlay to the video's height, maintaining aspect ratio
+        scaled_overlay = overlay_img.filter("scale", "-1", "ih")
+
+        # Overlay the scaled image onto the video
+        overlay_video = vid.overlay(scaled_overlay, eof_action="repeat")
+
+        # Create the output node, copying the audio only if it exists
+        streams = [overlay_video]
+        if has_audio(str(media_file)):
+            streams.append(vid.audio)
+
+        output_node = ffmpeg.output(
+            *streams,
+            str(output_path)
+        ).overwrite_output()
+
+        # Run the ffmpeg command
+        output_node.run(capture_stdout=True, capture_stderr=True)
+
         # Preserve original timestamps
         if output_path.exists():
             st = media_file.stat()
             os.utime(output_path, (st.st_atime, st.st_mtime))
             return True
-            
-    except Exception as e:
+
+    except ffmpeg.Error as e:
         logger.error(f"Overlay merge error for {media_file.name}: {e}")
-        
+        logger.error(f"ffmpeg stderr: {e.stderr.decode()}")
+
     return False
 
 def overlay_worker(args: Tuple[Path, Path, Path]) -> Optional[Tuple[str, Optional[int]]]:
-    """Worker function for overlay merging using overlaykit."""
+    """Worker function for overlay merging."""
     media_file, overlay_file, output_path = args
     if overlay_merge_single(media_file, overlay_file, output_path):
-        timestamp = extract_mp4_timestamp(media_file)
+        timestamp = extract_media_timestamp(media_file)
         return (media_file.name, timestamp)
     return None
 
@@ -93,7 +95,7 @@ def calculate_file_hash(file_path: Path) -> Optional[str]:
 
 def process_media_group(media_files: List[Path], overlay_files: List[Path],
                        output_dir: Path, group_type: str) -> Tuple[Optional[str], Dict]:
-    """Process a group of media files with overlays using overlaykit's optimized processing."""
+    """Process a group of media files with overlays."""
     stats = {'attempted': len(media_files), 'successful': 0, 'failed': 0}
 
     media_sorted = sorted(media_files, key=lambda x: x.name)
@@ -104,77 +106,39 @@ def process_media_group(media_files: List[Path], overlay_files: List[Path],
 
     try:
         ensure_directory(folder_path)
-        config = get_overlay_config()
-
         logger.info(f"Processing {group_type} group: {folder_name} with {len(media_files)} files")
 
         timestamps = {}
-        
-        if len(overlay_files) == 1:
-            # Single overlay for all media - use overlaykit's optimized overlay_many
+
+        for media, overlay in zip(media_sorted, overlay_sorted if len(overlay_files) > 1 else [overlay_files[0]] * len(media_sorted)):
             try:
-                media_paths = [str(media) for media in media_sorted]
-                overlay_path = str(overlay_files[0])
-                
-                # Use overlay_many for optimal parallel processing
-                result_paths = overlay_many(
-                    media_paths, 
-                    overlay_path, 
-                    str(folder_path),
-                    config=config
-                )
-                
-                # Process results and extract timestamps
-                for media_file, result_path in zip(media_sorted, result_paths):
-                    if Path(result_path).exists():
-                        stats['successful'] += 1
-                        
-                        # Extract timestamp from original media file
-                        timestamp = extract_mp4_timestamp(media_file)
-                        if timestamp:
-                            dt = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
-                            timestamps[media_file.name] = dt.isoformat().replace('+00:00', 'Z')
-                        
-                        # Preserve original file timestamps
-                        st = media_file.stat()
-                        os.utime(result_path, (st.st_atime, st.st_mtime))
-                    else:
-                        stats['failed'] += 1
-                        
-            except Exception as e:
-                logger.error(f"Error in overlay_many processing: {e}")
-                stats['failed'] = len(media_files)
-        else:
-            # Paired overlays - process individually 
-            for media, overlay in zip(media_sorted, overlay_sorted):
-                try:
-                    output_path = folder_path / media.name
-                    if overlay_merge_single(media, overlay, output_path):
-                        stats['successful'] += 1
-                        
-                        # Extract timestamp from original media file
-                        timestamp = extract_mp4_timestamp(media)
-                        if timestamp:
-                            dt = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
-                            timestamps[media.name] = dt.isoformat().replace('+00:00', 'Z')
-                    else:
-                        stats['failed'] += 1
-                except Exception as e:
-                    logger.error(f"Error processing {media.name}: {e}")
+                output_path = folder_path / media.name
+                if overlay_merge_single(media, overlay, output_path):
+                    stats['successful'] += 1
+
+                    # Extract timestamp from original media file
+                    timestamp = extract_media_timestamp(media)
+                    if timestamp:
+                        dt = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
+                        timestamps[media.name] = dt.isoformat().replace('+00:00', 'Z')
+                else:
                     stats['failed'] += 1
+            except Exception as e:
+                logger.error(f"Error processing {media.name}: {e}")
+                stats['failed'] += 1
 
         if stats['successful'] > 0:
             # Save timestamps metadata
             with open(folder_path / "timestamps.json", 'w', encoding='utf-8') as f:
                 json.dump(timestamps, f, indent=2)
-            
+
             logger.info(f"Successfully processed {stats['successful']}/{stats['attempted']} files in group {folder_name}")
             return folder_name, stats
         else:
             # Clean up if no files were processed successfully
             if folder_path.exists():
                 shutil.rmtree(folder_path)
-                
+
     except Exception as e:
         logger.error(f"Error processing {group_type} group: {e}")
         if folder_path.exists():
@@ -183,7 +147,7 @@ def process_media_group(media_files: List[Path], overlay_files: List[Path],
     return None, stats
 
 def merge_overlay_pairs(source_dir: Path, output_dir: Path) -> Tuple[Set[str], Dict[str, Any]]:
-    """Find and merge media/overlay pairs using overlaykit's optimized processing."""
+    """Find and merge media/overlay pairs."""
     logger.info("=" * 60)
     logger.info("Starting OVERLAY MERGING phase")
     logger.info("=" * 60)
@@ -193,14 +157,6 @@ def merge_overlay_pairs(source_dir: Path, output_dir: Path) -> Tuple[Set[str], D
         'total_overlay': 0,
         'total_merged': 0
     }
-
-    # Check if overlaykit can be used (FFmpeg availability is checked by overlaykit internally)
-    try:
-        config = get_overlay_config()
-        logger.info(f"Using overlaykit with {config.hw} acceleration and {config.jobs} parallel jobs")
-    except Exception as e:
-        logger.warning(f"Could not initialize overlaykit: {e}. Skipping overlay merging.")
-        return set(), stats
 
     merged_dir = output_dir / "merged_media"
     ensure_directory(merged_dir)
@@ -251,12 +207,12 @@ def merge_overlay_pairs(source_dir: Path, output_dir: Path) -> Tuple[Set[str], D
             # Check if overlays are identical (multipart) or different (grouped)
             if len(overlay_files) == 1 or (len(overlay_files) > 1 and
                 len(set(calculate_file_hash(f) for f in overlay_files)) == 1):
-                # Multipart: same overlay for all - use overlaykit's optimized overlay_many
+                # Multipart: same overlay for all
                 folder_name, group_stats = process_media_group(
                     media_files, overlay_files[:1], merged_dir, "multipart"
                 )
             else:
-                # Grouped: different overlays - process individually
+                # Grouped: different overlays
                 folder_name, group_stats = process_media_group(
                     media_files, overlay_files, merged_dir, "grouped"
                 )
@@ -300,10 +256,14 @@ def index_media_files(source_dir: Path, merged_dir: Optional[Path] = None) -> Tu
 
     media_index = {}
     stats = {'total_files': 0, 'extracted_ids': 0}
+    supported_media_extensions = ['.mp4', '.webp']
 
     # Index source files
     for item in source_dir.iterdir():
         if not item.is_file() or "thumbnail" in item.name.lower() or "_overlay~" in item.name:
+            continue
+        
+        if item.suffix.lower() not in supported_media_extensions:
             continue
 
         stats['total_files'] += 1
@@ -313,7 +273,7 @@ def index_media_files(source_dir: Path, merged_dir: Optional[Path] = None) -> Tu
             filename=item.name,
             source_path=item,
             media_id=media_id,
-            timestamp=extract_mp4_timestamp(item) if item.suffix.lower() == '.mp4' else None
+            timestamp=extract_media_timestamp(item)
         )
 
         if media_id:
@@ -324,6 +284,8 @@ def index_media_files(source_dir: Path, merged_dir: Optional[Path] = None) -> Tu
     if merged_dir and merged_dir.exists():
         for item in merged_dir.iterdir():
             if item.is_file():
+                if item.suffix.lower() not in supported_media_extensions:
+                    continue
                 stats['total_files'] += 1
                 media_id = extract_media_id(item.name)
 
@@ -331,7 +293,7 @@ def index_media_files(source_dir: Path, merged_dir: Optional[Path] = None) -> Tu
                     filename=item.name,
                     source_path=item,
                     media_id=media_id,
-                    timestamp=extract_mp4_timestamp(item) if item.suffix.lower() == '.mp4' else None,
+                    timestamp=extract_media_timestamp(item),
                     is_merged=True
                 )
 
@@ -352,7 +314,7 @@ def index_media_files(source_dir: Path, merged_dir: Optional[Path] = None) -> Tu
 
                 folder_indexed = False
                 for file_path in item.iterdir():
-                    if file_path.suffix.lower() == '.mp4':
+                    if file_path.suffix.lower() in supported_media_extensions:
                         media_id = extract_media_id(file_path.name)
 
                         if media_id:
@@ -370,6 +332,13 @@ def index_media_files(source_dir: Path, merged_dir: Optional[Path] = None) -> Tu
     logger.info("=" * 60)
 
     return media_index, stats
+
+def extract_media_timestamp(media_path: Path) -> Optional[int]:
+    """Extract creation timestamp from media file."""
+    if media_path.suffix.lower() == '.mp4':
+        return extract_mp4_timestamp(media_path)
+    # Timestamps for webp not supported in this version
+    return None
 
 def extract_mp4_timestamp(mp4_path: Path) -> Optional[int]:
     """Extract creation timestamp from MP4 file."""
