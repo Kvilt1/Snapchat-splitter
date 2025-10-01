@@ -28,6 +28,8 @@ from config import (
 import ffmpeg
 # PIL for WebP to PNG conversion
 from PIL import Image
+# System capability detection
+from system_utils import get_system_capabilities
 
 logger = logging.getLogger(__name__)
 
@@ -147,12 +149,18 @@ def cleanup_process_pool():
 
 def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path, 
                      allow_overwriting: bool = True, quiet: bool = True, 
-                     use_gpu: bool = True) -> bool:
+                     encoder_name: Optional[str] = None,
+                     encoder_options: Optional[Dict] = None) -> bool:
     """
-    Merge media with overlay using GPU acceleration.
+    Merge media with overlay using hardware acceleration when available.
     Returns True on success, False on failure.
     """
     try:
+        # Get system capabilities if not provided
+        if encoder_name is None or encoder_options is None:
+            sys_caps = get_system_capabilities()
+            encoder_name, encoder_options = sys_caps.get_optimal_encoder()
+        
         vid = ffmpeg.input(str(media_file))
         overlay_img = ffmpeg.input(str(overlay_file))
         
@@ -167,22 +175,8 @@ def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path,
         except:
             has_audio = False
         
-        # GPU-accelerated encoding settings
-        if use_gpu:
-            output_options = {
-                'vcodec': 'h264_nvenc',           # NVIDIA hardware encoder
-                'preset': 'fast',                  # Use standard preset (slow, medium, fast, hp, hq, etc.)
-                'cq': '23',                        # Constant quality (0-51, lower = better)
-                'b:v': '0',                        # Let CQ control bitrate
-            }
-        else:
-            # Fallback to CPU encoding
-            output_options = {
-                'vcodec': 'libx264',
-                'preset': 'ultrafast',
-                'crf': '23',
-            }
-        
+        # Use detected encoder options
+        output_options = encoder_options.copy()
         output_options['map_metadata'] = 0
         
         # Create output with or without audio
@@ -198,13 +192,24 @@ def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path,
         return True
         
     except ffmpeg.Error as err:
-        # If GPU encoding fails, retry with CPU
-        if use_gpu and 'nvenc' in str(err).lower():
-            logger.warning(f"GPU encoding failed for {media_file.name}, falling back to CPU")
-            return run_ffmpeg_merge(media_file, overlay_file, output_path, 
-                                   allow_overwriting, quiet, use_gpu=False)
-        
         stderr_output = err.stderr.decode('utf-8') if err.stderr else 'No stderr available'
+        
+        # If hardware encoding fails, fallback to CPU
+        if encoder_name != 'libx264' and ('nvenc' in str(err).lower() or 
+                                           'qsv' in str(err).lower() or
+                                           'vaapi' in str(err).lower() or
+                                           'videotoolbox' in str(err).lower()):
+            logger.warning(f"Hardware encoding ({encoder_name}) failed for {media_file.name}, falling back to CPU")
+            cpu_options = {
+                'vcodec': 'libx264',
+                'preset': 'ultrafast',
+                'crf': '23',
+            }
+            return run_ffmpeg_merge(media_file, overlay_file, output_path, 
+                                   allow_overwriting, quiet, 
+                                   encoder_name='libx264', 
+                                   encoder_options=cpu_options)
+        
         logger.error(f"ffmpeg error: {stderr_output}")
         return False
         
@@ -235,35 +240,6 @@ def calculate_file_hash(file_path: Path) -> Optional[str]:
         return None
 
 
-def get_optimal_gpu_workers() -> int:
-    """
-    Calculate optimal number of concurrent GPU encoding workers for GTX 1070.
-    
-    GTX 1070 Capabilities:
-    - 2 NVENC hardware engines (can time-slice many more sessions)
-    - 8GB VRAM (can handle 8-12 concurrent 1080p encodes with overlay)
-    - GPU compute for overlay filter (adds load but not a bottleneck)
-    
-    Returns optimal worker count based primarily on GPU memory and NVENC capacity.
-    CPU has minimal impact since encoding is GPU-bound.
-    """
-    # GTX 1070 optimal settings:
-    # - Official NVENC limit: 2 concurrent (but NVIDIA removed this in drivers)
-    # - Actual limit: ~8-12 sessions via time-slicing before performance degrades
-    # - VRAM limit: 8GB can handle ~10-12 concurrent 1080p encodes
-    # - Overlay filter: Adds ~500MB-1GB per stream
-    # 
-    # Optimal range for GTX 1070: 6-8 workers
-    # - 6 workers: Conservative, ensures smooth encoding
-    # - 8 workers: Aggressive, maximizes throughput
-    # - 10+ workers: May cause VRAM pressure and encoding slowdown
-    
-    return 6  # Balanced for GTX 1070
-    
-    # Users can override by setting GPU_WORKERS in config.py:
-    # - Set to 8 for maximum throughput (if VRAM allows)
-    # - Set to 4 if you're running other GPU apps simultaneously
-    # - Monitor with: watch -n 1 nvidia-smi
 
 
 def parallel_merge_worker(args: Tuple[Path, Path, Path]) -> Optional[Tuple[str, str]]:
@@ -280,12 +256,20 @@ def merge_overlay_pairs(source_dir: Path, output_dir: Path, max_workers: int = N
     logger.info("=" * 60)
     logger.info("Starting PARALLEL OVERLAY MERGING phase")
     logger.info("=" * 60)
+    
+    # Get system capabilities
+    sys_caps = get_system_capabilities()
+    logger.info("\n" + "=" * 60)
+    logger.info("SYSTEM CAPABILITIES:")
+    logger.info("=" * 60)
+    logger.info(sys_caps.get_capabilities_summary())
+    logger.info("=" * 60 + "\n")
 
     if max_workers is None:
-        # Check config first, then auto-detect
-        max_workers = GPU_WORKERS if GPU_WORKERS is not None else get_optimal_gpu_workers()
+        # Check config first, then auto-detect based on system
+        max_workers = sys_caps.get_optimal_workers(GPU_WORKERS)
     
-    logger.info(f"Using {max_workers} parallel workers for GPU-accelerated encoding")
+    logger.info(f"Using {max_workers} parallel workers for encoding")
 
     merged_dir = output_dir / "merged_media"
     ensure_directory(merged_dir)
@@ -361,11 +345,14 @@ def merge_overlay_pairs(source_dir: Path, output_dir: Path, max_workers: int = N
     merged_files = set()
     
     # Execute operations in parallel with progress bar
+    encoder_name, _ = sys_caps.get_optimal_encoder()
+    encoder_display = encoder_name.upper().replace('_', ' ')
+    
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_op = {executor.submit(parallel_merge_worker, op): op for op in merge_operations}
         
-        # Progress bar for GPU-accelerated overlay merging
-        with tqdm(total=len(merge_operations), desc="GPU encoding (NVENC)", unit="videos",
+        # Progress bar for overlay merging
+        with tqdm(total=len(merge_operations), desc=f"Encoding ({encoder_display})", unit="videos",
                  bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
             for future in as_completed(future_to_op):
                 result = future.result()

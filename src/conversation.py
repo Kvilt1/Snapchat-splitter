@@ -55,7 +55,13 @@ def determine_account_owner(conversations: Dict[str, List]) -> str:
 def create_conversation_metadata(conv_id: str, messages: List[Dict],
                                 friends_json: Dict, owner: str) -> Dict:
     """Create metadata for a conversation."""
-    is_group = any(msg.get("Conversation Title") for msg in messages)
+    # Group chat: has "Conversation Title" field that is not "NULL"
+    # Individual: has "Conversation Title": "NULL" or no field at all
+    def is_group_message(msg):
+        title = msg.get("Conversation Title")
+        return title is not None and title != "NULL"
+    
+    is_group = any(is_group_message(msg) for msg in messages)
 
     # Get participants inline
     participants = set()
@@ -248,7 +254,13 @@ def generate_index_json(conversations: Dict[str, List[Dict]], friends_json: Dict
             continue
         
         # Check if it's a group
-        is_group = any(msg.get("Conversation Title") for msg in messages)
+        # Group chat: has "Conversation Title" field that is not "NULL"
+        # Individual: has "Conversation Title": "NULL" or no field at all
+        def is_group_message(msg):
+            title = msg.get("Conversation Title")
+            return title is not None and title != "NULL"
+        
+        is_group = any(is_group_message(msg) for msg in messages)
         
         # Collect participants
         participants = set()

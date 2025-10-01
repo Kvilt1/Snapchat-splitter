@@ -1,22 +1,23 @@
-# Core dependencies
-ffmpeg-python>=0.2.0
-imageio[ffmpeg]>=2.9.0
-Pillow>=10.0.0
+# Snapchat Media Mapper - Python Dependencies
+# ===============================================
+# Note: This tool also requires ffmpeg to be installed on your system
+# See README.md for ffmpeg installation instructions
 
-# Image/video processing
-numpy>=1.19.0
+# Core video/media processing
+ffmpeg-python>=0.2.0       # Python bindings for ffmpeg
+imageio[ffmpeg]>=2.9.0     # Image and video I/O
+Pillow>=10.0.0             # Image processing (WebP conversion)
+numpy>=1.19.0              # Required by imageio
 
-# Progress bars and UI
-tqdm>=4.65.0
+# Progress tracking and UI
+tqdm>=4.65.0               # Progress bars
 
-# System monitoring (for optimal worker calculation)
-psutil>=5.8.0
+# System monitoring and optimization
+psutil>=5.8.0              # System resource detection (CPU, RAM)
 
 # Timezone handling
-pytz>=2023.3
+pytz>=2023.3               # Timezone conversions (Faroese timezone)
 
-# Standard library enhancements  
-pathlib2>=2.3.5; python_version < '3.4'
-
-# Optional: GPU monitoring (uncomment to enable nvidia-smi integration)
-# pynvml>=11.0.0
+# Optional: Advanced GPU monitoring
+# Uncomment below to enable NVIDIA GPU monitoring via Python
+# pynvml>=11.0.0           # NVIDIA Management Library (optional)

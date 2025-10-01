@@ -19,11 +19,12 @@ QUICKTIME_EPOCH_ADJUSTER = 2082844800
 # Timezone configuration
 FAROESE_TZ = pytz.timezone('Atlantic/Faroe')  # Faroese Atlantic Time (UTC-1/UTC+0 with DST)
 
-# GPU Encoding Configuration (GTX 1070 optimized)
-GPU_ENCODING_ENABLED = True  # Set to False to use CPU encoding
-GPU_PRESET = 'p4'  # p1 (fastest) to p7 (slowest/best quality), p4 is balanced
-GPU_QUALITY = '23'  # Lower = better quality (18-28 recommended)
-GPU_WORKERS = 6  # Auto=6 workers for GTX 1070, or manually set 4-8 based on VRAM usage
+# Encoding Configuration
+# Set GPU_WORKERS to override auto-detection:
+# - None: Auto-detect based on hardware (recommended)
+# - 4-8: For systems with hardware encoders (NVIDIA/AMD/Intel)
+# - 2-4: For CPU encoding
+GPU_WORKERS = None  # Auto-detect optimal worker count
 
 # Performance tuning
 USE_FAST_TIMESTAMP_EXTRACTION = True  # Use ffprobe instead of manual parsing
