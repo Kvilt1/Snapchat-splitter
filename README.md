@@ -7,6 +7,7 @@ A powerful Python tool to organize and map your Snapchat export data by date, co
 - 🎯 **Smart Media Mapping**: Maps media files to messages using Media IDs and timestamps
 - 🎬 **Overlay Merging**: Automatically merges video overlays (text, drawings) with base videos
 - 📅 **Day-Based Organization**: Organizes all content by calendar day (Faroese timezone)
+- 🎨 **Bitmoji Integration**: Automatically fetches and generates avatar images for all users
 - ⚡ **Hardware Acceleration**: Auto-detects and uses GPU encoders (NVIDIA NVENC, Intel QSV, AMD VAAPI, macOS VideoToolbox)
 - 🔄 **Cross-Platform**: Works on Windows, macOS, and Linux
 - 🚀 **Parallel Processing**: Multi-threaded encoding and file processing for speed
@@ -264,6 +265,10 @@ The tool creates this organized structure:
 ```
 output/
 ├── index.json                       # Master index with all users/groups
+├── bitmoji/                         # Avatar images for all users
+│   ├── username1.svg                # Bitmoji or fallback avatar
+│   ├── username2.svg
+│   └── ...
 └── days/                            # Organized by date
     ├── 2024-01-15/                  # Each day has its own folder
     │   ├── conversations.json       # All conversations for this day
@@ -295,7 +300,8 @@ Example:
   "users": [
     {
       "username": "friend1",
-      "display_name": "Friend One"
+      "display_name": "Friend One",
+      "bitmoji": "bitmoji/friend1.svg"
     }
   ],
   "groups": [
@@ -401,12 +407,27 @@ The tool automatically detects and uses the best encoder:
 
 If hardware encoding fails, it automatically falls back to CPU encoding.
 
-### 5. Parallel Processing
+### 5. Bitmoji Avatar Generation
+
+The tool automatically fetches Bitmoji avatars for all users:
+- Fetches real Bitmoji from Snapchat's API when available
+- Generates unique, color-coded fallback avatars for users without Bitmoji
+- Saves all avatars as SVG files in `output/bitmoji/`
+- Updates index.json with relative paths to each avatar
+- Uses parallel processing (up to 128 concurrent requests) for speed
+
+Fallback avatars are:
+- Deterministic (same username always gets same color)
+- Visually distinct (uses color separation algorithm)
+- Ghost-themed to match Snapchat's brand
+
+### 6. Parallel Processing
 
 The tool uses parallel processing for:
 - **Overlay merging**: Multiple videos encoded simultaneously
 - **WebP conversion**: Batch conversion of overlay images
 - **Timestamp extraction**: Parallel MP4 metadata reading
+- **Bitmoji fetching**: Concurrent API requests for avatar images
 
 Worker count is auto-detected based on:
 - Available hardware encoders

@@ -11,6 +11,34 @@ from config import utc_to_faroese, format_faroese_timestamp, get_faroese_date
 
 logger = logging.getLogger(__name__)
 
+
+def _is_group_message(msg: Dict) -> bool:
+    """Check if message indicates a group chat.
+    
+    Group chat: has "Conversation Title" field that is not "NULL"
+    Individual: has "Conversation Title": "NULL" or no field at all
+    """
+    title = msg.get("Conversation Title")
+    return title is not None and title != "NULL"
+
+
+def _build_friends_map(friends_json: Dict) -> Dict[str, Dict]:
+    """Build unified friends map with display names and metadata."""
+    friends_map = {}
+    for friend in friends_json.get("Friends", []):
+        friends_map[friend["Username"]] = {
+            **friend,
+            "friend_status": "active",
+            "friend_list_section": "Friends"
+        }
+    for friend in friends_json.get("Deleted Friends", []):
+        friends_map[friend["Username"]] = {
+            **friend,
+            "friend_status": "deleted",
+            "friend_list_section": "Deleted Friends"
+        }
+    return friends_map
+
 def merge_conversations(chat_data: Dict, snap_data: Dict) -> Dict[str, List]:
     """Merge chat and snap histories."""
     logger.info("Merging chat and snap histories")
@@ -55,13 +83,7 @@ def determine_account_owner(conversations: Dict[str, List]) -> str:
 def create_conversation_metadata(conv_id: str, messages: List[Dict],
                                 friends_json: Dict, owner: str) -> Dict:
     """Create metadata for a conversation."""
-    # Group chat: has "Conversation Title" field that is not "NULL"
-    # Individual: has "Conversation Title": "NULL" or no field at all
-    def is_group_message(msg):
-        title = msg.get("Conversation Title")
-        return title is not None and title != "NULL"
-    
-    is_group = any(is_group_message(msg) for msg in messages)
+    is_group = any(_is_group_message(msg) for msg in messages)
 
     # Get participants inline
     participants = set()
@@ -74,17 +96,8 @@ def create_conversation_metadata(conv_id: str, messages: List[Dict],
         participants.add(conv_id)
     participants.discard(owner)
 
-    # Process friends inline
-    friends_map = {}
-    for friend in friends_json.get("Friends", []):
-        friend["friend_status"] = "active"
-        friend["friend_list_section"] = "Friends"
-        friends_map[friend["Username"]] = friend
-
-    for friend in friends_json.get("Deleted Friends", []):
-        friend["friend_status"] = "deleted"
-        friend["friend_list_section"] = "Deleted Friends"
-        friends_map[friend["Username"]] = friend
+    # Build friends map
+    friends_map = _build_friends_map(friends_json)
 
     # Build participant list
     participants_list = []
@@ -238,12 +251,12 @@ def generate_index_json(conversations: Dict[str, List[Dict]], friends_json: Dict
     Returns:
         Simplified index dictionary with users and groups
     """
-    # Build friends map
-    friends_map = {}
+    # Build friends map for display names
+    friends_display_map = {}
     for friend in friends_json.get("Friends", []):
-        friends_map[friend["Username"]] = friend.get("Display Name", friend["Username"])
+        friends_display_map[friend["Username"]] = friend.get("Display Name", friend["Username"])
     for friend in friends_json.get("Deleted Friends", []):
-        friends_map[friend["Username"]] = friend.get("Display Name", friend["Username"])
+        friends_display_map[friend["Username"]] = friend.get("Display Name", friend["Username"])
     
     # Collect all unique users and groups
     all_users = set()
@@ -254,13 +267,7 @@ def generate_index_json(conversations: Dict[str, List[Dict]], friends_json: Dict
             continue
         
         # Check if it's a group
-        # Group chat: has "Conversation Title" field that is not "NULL"
-        # Individual: has "Conversation Title": "NULL" or no field at all
-        def is_group_message(msg):
-            title = msg.get("Conversation Title")
-            return title is not None and title != "NULL"
-        
-        is_group = any(is_group_message(msg) for msg in messages)
+        is_group = any(_is_group_message(msg) for msg in messages)
         
         # Collect participants
         participants = set()
@@ -301,7 +308,8 @@ def generate_index_json(conversations: Dict[str, List[Dict]], friends_json: Dict
     for username in sorted(all_users):
         users.append({
             "username": username,
-            "display_name": friends_map.get(username, username)
+            "display_name": friends_display_map.get(username, username),
+            "bitmoji": None  # Will be populated by bitmoji generation
         })
     
     # Sort groups by name

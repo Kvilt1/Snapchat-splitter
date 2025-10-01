@@ -18,6 +18,10 @@ psutil>=5.8.0              # System resource detection (CPU, RAM)
 # Timezone handling
 pytz>=2023.3               # Timezone conversions (Faroese timezone)
 
+# Network requests (for Bitmoji fetching)
+requests>=2.31.0           # HTTP library for API calls
+urllib3>=2.0.0             # HTTP client (used by requests)
+
 # Optional: Advanced GPU monitoring
 # Uncomment below to enable NVIDIA GPU monitoring via Python
 # pynvml>=11.0.0           # NVIDIA Management Library (optional)

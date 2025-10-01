@@ -20,6 +20,7 @@ from config import (
     save_json,
     sanitize_filename,
     safe_materialize,
+    get_media_type,
     Stats,
     logger
 )
@@ -28,8 +29,7 @@ from tqdm import tqdm
 from media_processing import (
     merge_overlay_pairs,
     index_media_files,
-    map_media_to_messages,
-    cleanup_process_pool
+    map_media_to_messages
 )
 
 from conversation import (
@@ -42,6 +42,8 @@ from conversation import (
     extract_date_from_filename,
     convert_message_timestamp
 )
+
+from bitmoji import generate_bitmoji_assets
 
 # Global cleanup registry
 _temp_directories = []
@@ -85,7 +87,6 @@ def signal_handler(signum, frame):
     logger.info("INTERRUPTED - Cleaning up and exiting...")
     logger.info("=" * 60)
     
-    cleanup_process_pool()
     cleanup_temp_directories()
     
     logger.info("Cleanup complete. Exiting.")
@@ -102,40 +103,145 @@ def find_export_folder(input_dir: Path) -> Path:
         "Place your export folder (e.g., 'mydata') inside 'input' directory."
     )
 
-def process_conversation_media(conv_id: str, messages: list, mapping: dict,
-                             conv_dir: Path) -> None:
-    """Materialize media files for a conversation on demand."""
-    if not mapping:
-        return
+def _log_phase_header(phase_name: str) -> None:
+    """Log a phase header with separators.
+    
+    Args:
+        phase_name: Name of the phase to log
+    """
+    logger.info("=" * 60)
+    logger.info(f"PHASE: {phase_name}")
+    logger.info("=" * 60)
 
-    media_dir = conv_dir / "media"
-    ensure_directory(media_dir)
 
-    for msg_idx, items in mapping.items():
-        if msg_idx >= len(messages):
+def _load_json_files(json_dir: Path) -> tuple[Dict, Dict, Dict]:
+    """Load required JSON files with progress tracking.
+    
+    Args:
+        json_dir: Directory containing JSON files
+        
+    Returns:
+        Tuple of (chat_data, snap_data, friends_json)
+    """
+    json_files = ["chat_history.json", "snap_history.json", "friends.json"]
+    with tqdm(total=len(json_files), desc="Loading JSON data", unit="files") as pbar:
+        pbar.set_postfix_str("chat_history.json")
+        chat_data = load_json(json_dir / "chat_history.json")
+        pbar.update(1)
+        
+        pbar.set_postfix_str("snap_history.json")
+        snap_data = load_json(json_dir / "snap_history.json")
+        pbar.update(1)
+        
+        pbar.set_postfix_str("friends.json")
+        friends_json = load_json(json_dir / "friends.json")
+        pbar.update(1)
+    
+    return chat_data, snap_data, friends_json
+
+
+def _process_day_media(
+    day_msg: Dict,
+    ts_index: Dict[int, list],
+    mappings: Dict[str, Dict],
+    conv_id: str,
+    day_media_dir: Path
+) -> tuple[list, list, int]:
+    """Process media mapping for a single day message.
+    
+    Args:
+        day_msg: The message dictionary to process
+        ts_index: Timestamp to original message index mapping
+        mappings: Media file mappings by conversation and message index
+        conv_id: Conversation ID
+        day_media_dir: Directory for the day's media files
+        
+    Returns:
+        Tuple of (media_locations, matched_files, media_count)
+    """
+    day_ts = day_msg.get("Created(microseconds)", 0)
+    orig_indices = ts_index.get(day_ts, [])
+    
+    media_locations = []
+    matched_files = []
+    media_count = 0
+    
+    # Check all original message indices with this timestamp
+    for orig_idx in orig_indices:
+        if orig_idx not in mappings[conv_id]:
             continue
-
-        media_locations = []
-        matched_files = []
-
+            
+        items = mappings[conv_id][orig_idx]
+        
         for item in items:
             media_file = item["media_file"]
-            dest = media_dir / media_file.filename
-
-            # Handle single file
+            dest = day_media_dir / media_file.filename
+            
             if safe_materialize(media_file.source_path, dest):
                 matched_files.append(media_file.filename)
             location = f"media/{media_file.filename}"
             media_locations.append(location)
-
-        # Update message
-        messages[msg_idx]["media_locations"] = media_locations
-        messages[msg_idx]["matched_media_files"] = matched_files
-        messages[msg_idx]["is_grouped"] = False  # All files are now individual
-        messages[msg_idx]["mapping_method"] = items[0]["mapping_method"]
-
+            media_count += 1
+        
+        # Update day message
+        day_msg["media_locations"] = media_locations
+        day_msg["matched_media_files"] = matched_files
+        day_msg["is_grouped"] = False
+        day_msg["mapping_method"] = items[0]["mapping_method"]
+        
         if "time_diff_seconds" in items[0]:
-            messages[msg_idx]["time_diff_seconds"] = items[0]["time_diff_seconds"]
+            day_msg["time_diff_seconds"] = items[0]["time_diff_seconds"]
+        
+        break  # Only apply first matching index for this timestamp
+    
+    return media_locations, matched_files, media_count
+
+
+def _log_final_summary(stats: Stats, total_time: float, output_dir: Path, index_stats: Dict) -> None:
+    """Log the final processing summary with detailed statistics.
+    
+    Args:
+        stats: Processing statistics object
+        total_time: Total processing time in seconds
+        output_dir: Output directory path
+        index_stats: Index statistics dictionary
+    """
+    logger.info("=" * 60)
+    logger.info("         PROCESSING COMPLETE - SUMMARY")
+    logger.info("=" * 60)
+
+    # Calculate totals
+    total_media_discovered = stats.total_media + stats.total_overlay
+    total_processed = stats.total_merged + (index_stats.get('total_files', 0) - stats.total_merged)
+    total_mapped = stats.mapped_by_id + stats.mapped_by_timestamp
+
+    logger.info(f"Total media files discovered:        {total_media_discovered}")
+    logger.info(f"Successfully processed:              {total_processed}")
+    if total_media_discovered > 0:
+        process_pct = (total_processed / total_media_discovered) * 100
+        logger.info(f"  - Processing rate:                 {process_pct:.1f}%")
+    logger.info(f"  - Merged with overlays:            {stats.total_merged}")
+
+    logger.info("")
+    logger.info("Mapping Results:")
+    logger.info(f"  - Mapped by Media ID:              {stats.mapped_by_id}")
+    logger.info(f"  - Mapped by timestamp:             {stats.mapped_by_timestamp}")
+    logger.info(f"  - Total mapped:                    {total_mapped}")
+    logger.info(f"  - Orphaned (unmapped):             {stats.orphaned}")
+
+    if total_processed > 0:
+        map_pct = (total_mapped / total_processed) * 100
+        logger.info(f"  - Mapping success rate:            {map_pct:.1f}%")
+
+    logger.info("")
+    logger.info("Processing Time:")
+    for phase, duration in stats.phase_times.items():
+        logger.info(f"  - {phase.replace('_', ' ').title():<30} {duration:.1f}s")
+    logger.info(f"  - {'Total':<30} {total_time:.1f}s")
+    
+    logger.info("=" * 60)
+    logger.info(f"✓ Check '{output_dir}' directory for results")
+    logger.info("=" * 60)
 
 
 def main():
@@ -166,9 +272,7 @@ def main():
     try:
         # INITIALIZATION PHASE
         phase_start = time.time()
-        logger.info("=" * 60)
-        logger.info("PHASE: INITIALIZATION")
-        logger.info("=" * 60)
+        _log_phase_header("INITIALIZATION")
 
         # Clean output if requested
         if not args.no_clean and args.output.exists():
@@ -196,24 +300,10 @@ def main():
 
         # DATA LOADING PHASE
         phase_start = time.time()
-        logger.info("=" * 60)
-        logger.info("PHASE: DATA LOADING AND PROCESSING")
-        logger.info("=" * 60)
+        _log_phase_header("DATA LOADING AND PROCESSING")
 
         # Load JSON files with progress indication
-        json_files = ["chat_history.json", "snap_history.json", "friends.json"]
-        with tqdm(total=len(json_files), desc="Loading JSON data", unit="files") as pbar:
-            pbar.set_postfix_str("chat_history.json")
-            chat_data = load_json(json_dir / "chat_history.json")
-            pbar.update(1)
-            
-            pbar.set_postfix_str("snap_history.json")
-            snap_data = load_json(json_dir / "snap_history.json")
-            pbar.update(1)
-            
-            pbar.set_postfix_str("friends.json")
-            friends_json = load_json(json_dir / "friends.json")
-            pbar.update(1)
+        chat_data, snap_data, friends_json = _load_json_files(json_dir)
 
         if not chat_data and not snap_data:
             raise ValueError("No chat or snap data found")
@@ -239,9 +329,7 @@ def main():
 
         # DAY-BASED OUTPUT ORGANIZATION PHASE
         phase_start = time.time()
-        logger.info("=" * 60)
-        logger.info("PHASE: DAY-BASED OUTPUT ORGANIZATION")
-        logger.info("=" * 60)
+        _log_phase_header("DAY-BASED OUTPUT ORGANIZATION")
 
         ensure_directory(args.output)
 
@@ -255,8 +343,29 @@ def main():
         # Generate index.json with all conversation metadata
         logger.info("Generating index.json...")
         index_json = generate_index_json(conversations, friends_json, account_owner, days_data)
+        
+        # BITMOJI GENERATION PHASE
+        phase_start = time.time()
+        _log_phase_header("BITMOJI GENERATION")
+        
+        # Extract all unique usernames
+        all_usernames = {user["username"] for user in index_json["users"]}
+        logger.info(f"Generating Bitmoji avatars for {len(all_usernames)} users...")
+        
+        # Generate and save Bitmoji avatars
+        bitmoji_paths = generate_bitmoji_assets(all_usernames, args.output)
+        
+        # Update index.json with Bitmoji paths
+        for user in index_json["users"]:
+            username = user["username"]
+            user["bitmoji"] = bitmoji_paths.get(username)
+        
+        # Save index.json with Bitmoji paths
         save_json(index_json, args.output / "index.json")
         logger.info(f"Generated index.json with {len(index_json['users'])} users and {len(index_json['groups'])} groups")
+        logger.info(f"Saved {len(bitmoji_paths)} Bitmoji avatars to output/bitmoji/")
+        stats.phase_times['bitmoji_generation'] = time.time() - phase_start
+        logger.info("=" * 60)
 
         # Create days folder
         days_dir = args.output / "days"
@@ -338,47 +447,20 @@ def main():
                         ts_index = timestamp_to_index.get(conv_id, {})
                         
                         for day_msg in day_messages:
-                            day_ts = day_msg.get("Created(microseconds)", 0)
-                            orig_indices = ts_index.get(day_ts, [])
+                            media_locations, matched_files, media_count = _process_day_media(
+                                day_msg, ts_index, mappings, conv_id, day_media_dir
+                            )
                             
-                            # Check all original message indices with this timestamp
-                            for orig_idx in orig_indices:
-                                if orig_idx in mappings[conv_id]:
-                                    items = mappings[conv_id][orig_idx]
-                                    
-                                    media_locations = []
-                                    matched_files = []
-                                    
-                                    for item in items:
-                                        media_file = item["media_file"]
-                                        dest = day_media_dir / media_file.filename
-                                        
-                                        if safe_materialize(media_file.source_path, dest):
-                                            matched_files.append(media_file.filename)
-                                        location = f"media/{media_file.filename}"
-                                        media_locations.append(location)
-                                        day_total_media += 1
-                                    
-                                    # Update day message
-                                    day_msg["media_locations"] = media_locations
-                                    day_msg["matched_media_files"] = matched_files
-                                    day_msg["is_grouped"] = False
-                                    day_msg["mapping_method"] = items[0]["mapping_method"]
-                                    
-                                    if "time_diff_seconds" in items[0]:
-                                        day_msg["time_diff_seconds"] = items[0]["time_diff_seconds"]
-                                    
-                                    # Track statistics
-                                    total_mapped_items_after += len(items)
-                                    messages_with_media += 1
-                                    break  # Only apply first matching index for this timestamp
+                            if media_locations:
+                                day_total_media += media_count
+                                total_mapped_items_after += media_count
+                                messages_with_media += 1
                     
                     # Clean up Created(microseconds) from messages before saving
-                    clean_messages = []
-                    for msg in day_messages:
-                        msg_copy = msg.copy()
-                        msg_copy.pop("Created(microseconds)", None)
-                        clean_messages.append(msg_copy)
+                    clean_messages = [
+                        {k: v for k, v in msg.items() if k != "Created(microseconds)"}
+                        for msg in day_messages
+                    ]
                     
                     # Build conversation entry with metadata
                     conversation_entry = {
@@ -407,21 +489,14 @@ def main():
                         safe_materialize(media_file.source_path, orphaned_dir / media_file.filename)
                         
                         # Determine media type from extension
-                        ext = media_file.filename.split('.')[-1].lower()
-                        if ext in ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp']:
-                            media_type = "IMAGE"
-                        elif ext in ['mp4', 'mov', 'avi', 'mkv', 'webm']:
-                            media_type = "VIDEO"
-                        elif ext in ['mp3', 'wav', 'aac', 'm4a', 'ogg']:
-                            media_type = "AUDIO"
-                        else:
-                            media_type = "UNKNOWN"
+                        ext = media_file.filename.split('.')[-1]
+                        media_type = get_media_type(ext)
                         
                         orphaned_media_list.append({
                             "path": f"orphaned/{media_file.filename}",
                             "filename": media_file.filename,
                             "type": media_type,
-                            "extension": ext
+                            "extension": ext.lower()
                         })
                 
                 # Build day JSON structure
@@ -457,11 +532,8 @@ def main():
 
         # CLEANUP PHASE
         phase_start = time.time()
-        logger.info("=" * 60)
-        logger.info("PHASE: CLEANUP")
-        logger.info("=" * 60)
+        _log_phase_header("CLEANUP")
 
-        cleanup_process_pool()
         cleanup_temp_directories()
 
         logger.info("Cleanup complete")
@@ -469,43 +541,7 @@ def main():
 
         # FINAL SUMMARY
         total_time = time.time() - start_time
-
-        logger.info("=" * 60)
-        logger.info("         PROCESSING COMPLETE - SUMMARY")
-        logger.info("=" * 60)
-
-        # Calculate totals
-        total_media_discovered = stats.total_media + stats.total_overlay
-        total_processed = stats.total_merged + (index_stats.get('total_files', 0) - stats.total_merged)
-        total_mapped = stats.mapped_by_id + stats.mapped_by_timestamp
-
-        logger.info(f"Total media files discovered:        {total_media_discovered}")
-        logger.info(f"Successfully processed:              {total_processed}")
-        if total_media_discovered > 0:
-            process_pct = (total_processed / total_media_discovered) * 100
-            logger.info(f"  - Processing rate:                 {process_pct:.1f}%")
-        logger.info(f"  - Merged with overlays:            {stats.total_merged}")
-
-        logger.info("")
-        logger.info("Mapping Results:")
-        logger.info(f"  - Mapped by Media ID:              {stats.mapped_by_id}")
-        logger.info(f"  - Mapped by timestamp:             {stats.mapped_by_timestamp}")
-        logger.info(f"  - Total mapped:                    {total_mapped}")
-        logger.info(f"  - Orphaned (unmapped):             {stats.orphaned}")
-
-        if total_processed > 0:
-            map_pct = (total_mapped / total_processed) * 100
-            logger.info(f"  - Mapping success rate:            {map_pct:.1f}%")
-
-        logger.info("")
-        logger.info("Processing Time:")
-        for phase, duration in stats.phase_times.items():
-            logger.info(f"  - {phase.replace('_', ' ').title():<30} {duration:.1f}s")
-        logger.info(f"  - {'Total':<30} {total_time:.1f}s")
-        
-        logger.info("=" * 60)
-        logger.info(f"✓ Check '{args.output}' directory for results")
-        logger.info("=" * 60)
+        _log_final_summary(stats, total_time, args.output, index_stats)
         
         return 0
         
@@ -513,7 +549,6 @@ def main():
         logger.error("=" * 60)
         logger.error(f"ERROR: {e}")
         logger.error("=" * 60)
-        cleanup_process_pool()
         cleanup_temp_directories()
 
         return 1

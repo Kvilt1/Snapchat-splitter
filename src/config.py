@@ -37,6 +37,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Media type mappings
+MEDIA_TYPE_MAP = {
+    'IMAGE': ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'],
+    'VIDEO': ['mp4', 'mov', 'avi', 'mkv', 'webm'],
+    'AUDIO': ['mp3', 'wav', 'aac', 'm4a', 'ogg']
+}
+
 @dataclass
 class MediaFile:
     """Represents a media file with its metadata."""
@@ -164,3 +171,19 @@ def get_faroese_date(utc_timestamp_ms: int) -> str:
     """
     faroese_dt = utc_to_faroese(utc_timestamp_ms)
     return faroese_dt.strftime('%Y-%m-%d')
+
+
+def get_media_type(extension: str) -> str:
+    """Determine media type from file extension.
+    
+    Args:
+        extension: File extension (with or without dot)
+        
+    Returns:
+        Media type string: 'IMAGE', 'VIDEO', 'AUDIO', or 'UNKNOWN'
+    """
+    ext = extension.lstrip('.').lower()
+    for media_type, extensions in MEDIA_TYPE_MAP.items():
+        if ext in extensions:
+            return media_type
+    return "UNKNOWN"

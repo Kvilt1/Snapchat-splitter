@@ -33,6 +33,20 @@ from system_utils import get_system_capabilities
 
 logger = logging.getLogger(__name__)
 
+
+def _log_system_capabilities(sys_caps, encoder_name: str, max_workers: int) -> None:
+    """Log detected system capabilities.
+    
+    Args:
+        sys_caps: SystemCapabilities object with detected hardware
+        encoder_name: Name of the selected encoder
+        max_workers: Number of parallel workers
+    """
+    logger.info("System capabilities detected:")
+    logger.info(f"  FFmpeg: {sys_caps.ffmpeg_path or 'Not found'}")
+    logger.info(f"  Encoder: {encoder_name}")
+    logger.info(f"  Workers: {max_workers}")
+
 # Cache directory for converted PNG files
 CACHE_DIR = Path(".cache")
 
@@ -132,20 +146,6 @@ def batch_convert_webp_overlays(overlay_files: List[Path], cache_dir: Path, max_
     logger.info(f"Successfully converted {len(successful_conversions)}/{len(webp_files)} WebP files to PNG")
     return successful_conversions
 
-def cleanup_cache_directory():
-    """Clean up cache directory to free disk space."""
-    if CACHE_DIR.exists():
-        try:
-            shutil.rmtree(CACHE_DIR)
-            logger.debug(f"Cleaned up cache directory: {CACHE_DIR}")
-        except Exception as e:
-            logger.debug(f"Failed to clean up cache directory: {e}")
-
-def cleanup_process_pool():
-    """Cleanup function - no longer needed since we use ThreadPoolExecutor with context managers."""
-    # ThreadPoolExecutors are automatically cleaned up via 'with' statements
-    # Cache cleanup is now handled by main.py's cleanup_temp_directories()
-    pass
 
 def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path, 
                      allow_overwriting: bool = True, quiet: bool = True, 
@@ -172,7 +172,8 @@ def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path,
         try:
             probe_result = ffmpeg.probe(str(media_file))
             has_audio = any(stream['codec_type'] == 'audio' for stream in probe_result['streams'])
-        except:
+        except (ffmpeg.Error, KeyError, Exception) as e:
+            logger.debug(f"Could not detect audio stream for {media_file.name}: {e}")
             has_audio = False
         
         # Use detected encoder options
@@ -223,20 +224,13 @@ def overlay_merge_single(media_file: Path, overlay_file: Path, output_path: Path
     """
     return run_ffmpeg_merge(media_file, overlay_file, output_path)
 
-def overlay_worker(args: Tuple[Path, Path, Path]) -> Optional[Tuple[str, Optional[int]]]:
-    """Worker function for overlay merging using direct ffmpeg-python."""
-    media_file, overlay_file, output_path = args
-    if overlay_merge_single(media_file, overlay_file, output_path):
-        timestamp = extract_mp4_timestamp(media_file)
-        return (media_file.name, timestamp)
-    return None
-
 def calculate_file_hash(file_path: Path) -> Optional[str]:
     """Calculate MD5 hash of file."""
     try:
         with open(file_path, 'rb') as f:
             return hashlib.md5(f.read()).hexdigest()
-    except Exception:
+    except (OSError, IOError) as e:
+        logger.debug(f"Could not hash file {file_path}: {e}")
         return None
 
 
@@ -481,7 +475,8 @@ def extract_mp4_timestamp(mp4_path: Path) -> Optional[int]:
                     f.seek(struct.unpack('>Q', f.read(8))[0] - 16, 1)
                 else:
                     f.seek(size - 8, 1)
-    except Exception:
+    except (OSError, IOError, struct.error) as e:
+        logger.debug(f"Could not extract MP4 timestamp from {mp4_path}: {e}")
         return None
 
 
@@ -514,8 +509,9 @@ def extract_mp4_timestamp_fast(mp4_path: Path) -> Optional[int]:
         # Fallback to manual extraction
         return extract_mp4_timestamp(mp4_path)
         
-    except Exception:
-        # Silent fallback to manual extraction
+    except (ffmpeg.Error, ValueError, KeyError) as e:
+        # Fallback to manual extraction on ffprobe failure
+        logger.debug(f"ffprobe failed for {mp4_path}, using manual extraction: {e}")
         return extract_mp4_timestamp(mp4_path)
 
 
