@@ -314,26 +314,27 @@ def main():
                 day_dir = days_dir / day
                 ensure_directory(day_dir)
                 
-                # Create conversations subfolder
-                conversations_dir = day_dir / "conversations"
-                ensure_directory(conversations_dir)
-
+                # Create shared media folder for this day
+                day_media_dir = day_dir / "media"
+                ensure_directory(day_media_dir)
+                
+                # Create orphaned folder
+                orphaned_dir = day_dir / "orphaned"
+                
                 # Process conversations for this day
                 day_conversations = days_data[day]
+                conversations_output = []
+                day_total_messages = 0
+                day_total_media = 0
                 
                 for conv_id, day_messages in day_conversations.items():
-                    # Use cached metadata and folder name
-                    folder_name = conv_folder_names[conv_id]
-                    
-                    # Create conversation folder for this day inside conversations/
-                    conv_dir = conversations_dir / folder_name
-                    ensure_directory(conv_dir)
-                    
-                    # Find media for this day's messages
-                    day_media_dir = conv_dir / "media"
+                    # Get metadata for this conversation
+                    all_messages = conversations[conv_id]
+                    metadata = conv_metadata_cache.get(conv_id)
+                    folder_name = conv_folder_names.get(conv_id)
                     
                     if conv_id in mappings:
-                        # Use timestamp index for O(1) lookup instead of O(n*m)
+                        # Use timestamp index for O(1) lookup
                         ts_index = timestamp_to_index.get(conv_id, {})
                         
                         for day_msg in day_messages:
@@ -344,9 +345,6 @@ def main():
                             for orig_idx in orig_indices:
                                 if orig_idx in mappings[conv_id]:
                                     items = mappings[conv_id][orig_idx]
-                                    # Materialize media
-                                    if not day_media_dir.exists():
-                                        ensure_directory(day_media_dir)
                                     
                                     media_locations = []
                                     matched_files = []
@@ -359,8 +357,9 @@ def main():
                                             matched_files.append(media_file.filename)
                                         location = f"media/{media_file.filename}"
                                         media_locations.append(location)
+                                        day_total_media += 1
                                     
-                                    # Update day message (last one wins if multiple matches)
+                                    # Update day message
                                     day_msg["media_locations"] = media_locations
                                     day_msg["matched_media_files"] = matched_files
                                     day_msg["is_grouped"] = False
@@ -381,18 +380,67 @@ def main():
                         msg_copy.pop("Created(microseconds)", None)
                         clean_messages.append(msg_copy)
                     
-                    # Save this day's conversation data
-                    save_json({
+                    # Build conversation entry with metadata
+                    conversation_entry = {
+                        "id": folder_name,
+                        "conversation_id": conv_id,
+                        "conversation_type": metadata.get("conversation_type") if metadata else "unknown",
                         "messages": clean_messages
-                    }, conv_dir / "conversation.json")
+                    }
+                    
+                    # Add group name if applicable
+                    if metadata and metadata.get("conversation_type") == "group":
+                        for msg in all_messages:
+                            if msg.get("Conversation Title"):
+                                conversation_entry["group_name"] = msg["Conversation Title"]
+                                break
+                    
+                    conversations_output.append(conversation_entry)
+                    day_total_messages += len(clean_messages)
                 
                 # Handle orphaned media for this day
+                orphaned_media_list = []
                 if day in orphaned_by_day:
-                    orphaned_dir = day_dir / "orphaned"
                     ensure_directory(orphaned_dir)
                     
                     for media_file in orphaned_by_day[day]:
                         safe_materialize(media_file.source_path, orphaned_dir / media_file.filename)
+                        
+                        # Determine media type from extension
+                        ext = media_file.filename.split('.')[-1].lower()
+                        if ext in ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp']:
+                            media_type = "IMAGE"
+                        elif ext in ['mp4', 'mov', 'avi', 'mkv', 'webm']:
+                            media_type = "VIDEO"
+                        elif ext in ['mp3', 'wav', 'aac', 'm4a', 'ogg']:
+                            media_type = "AUDIO"
+                        else:
+                            media_type = "UNKNOWN"
+                        
+                        orphaned_media_list.append({
+                            "path": f"orphaned/{media_file.filename}",
+                            "filename": media_file.filename,
+                            "type": media_type,
+                            "extension": ext
+                        })
+                
+                # Build day JSON structure
+                day_json = {
+                    "date": day,
+                    "stats": {
+                        "conversationCount": len(conversations_output),
+                        "messageCount": day_total_messages,
+                        "mediaCount": day_total_media
+                    },
+                    "conversations": conversations_output,
+                    "orphanedMedia": {
+                        "orphaned_media_count": len(orphaned_media_list),
+                        "orphaned_media": orphaned_media_list
+                    }
+                }
+                
+                # Save single conversations.json for this day
+                save_json(day_json, day_dir / "conversations.json")
                 
                 day_pbar.update(1)
 
