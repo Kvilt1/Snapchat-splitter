@@ -256,7 +256,7 @@ def main():
         logger.info("Generating index.json...")
         index_json = generate_index_json(conversations, friends_json, account_owner, days_data)
         save_json(index_json, args.output / "index.json")
-        logger.info(f"Generated index.json with {len(index_json['conversations'])} conversations")
+        logger.info(f"Generated index.json with {len(index_json['users'])} users and {len(index_json['groups'])} groups")
 
         # Create days folder
         days_dir = args.output / "days"
@@ -285,21 +285,38 @@ def main():
                 folder_name = get_conversation_folder_name(metadata, all_messages)
                 conv_folder_names[conv_id] = sanitize_filename(folder_name)
 
-        # Build timestamp index for faster lookup
+        # Build timestamp index for faster lookup (handles duplicate timestamps)
         logger.info("Building timestamp index for media mapping...")
         timestamp_to_index = {}
         for conv_id, all_messages in conversations.items():
             timestamp_to_index[conv_id] = {}
             for orig_idx, orig_msg in enumerate(all_messages):
                 orig_ts = orig_msg.get("Created(microseconds)", 0)
-                if orig_ts > 0:
-                    timestamp_to_index[conv_id][orig_ts] = orig_idx
+                # Store list of indices for each timestamp to handle duplicates
+                if orig_ts not in timestamp_to_index[conv_id]:
+                    timestamp_to_index[conv_id][orig_ts] = []
+                timestamp_to_index[conv_id][orig_ts].append(orig_idx)
+        
+        # Calculate total mapped media before splitting
+        total_mapped_items_before = sum(
+            len(msg_mappings) 
+            for conv_mappings in mappings.values() 
+            for msg_mappings in conv_mappings.values()
+        )
+        logger.info(f"Total mapped media items before day splitting: {total_mapped_items_before}")
 
-        # Process each day
+        # Process each day and track mapping preservation
+        total_mapped_items_after = 0
+        messages_with_media = 0
+        
         with tqdm(total=len(all_days), desc="Processing days", unit="days") as day_pbar:
             for day in all_days:
                 day_dir = days_dir / day
                 ensure_directory(day_dir)
+                
+                # Create conversations subfolder
+                conversations_dir = day_dir / "conversations"
+                ensure_directory(conversations_dir)
 
                 # Process conversations for this day
                 day_conversations = days_data[day]
@@ -308,8 +325,8 @@ def main():
                     # Use cached metadata and folder name
                     folder_name = conv_folder_names[conv_id]
                     
-                    # Create conversation folder for this day
-                    conv_dir = day_dir / folder_name
+                    # Create conversation folder for this day inside conversations/
+                    conv_dir = conversations_dir / folder_name
                     ensure_directory(conv_dir)
                     
                     # Find media for this day's messages
@@ -317,38 +334,45 @@ def main():
                     
                     if conv_id in mappings:
                         # Use timestamp index for O(1) lookup instead of O(n*m)
-                        ts_index = timestamp_to_index[conv_id]
+                        ts_index = timestamp_to_index.get(conv_id, {})
                         
                         for day_msg in day_messages:
                             day_ts = day_msg.get("Created(microseconds)", 0)
-                            orig_idx = ts_index.get(day_ts)
+                            orig_indices = ts_index.get(day_ts, [])
                             
-                            if orig_idx is not None and orig_idx in mappings[conv_id]:
-                                items = mappings[conv_id][orig_idx]
-                                # Materialize media
-                                if not day_media_dir.exists():
-                                    ensure_directory(day_media_dir)
-                                
-                                media_locations = []
-                                matched_files = []
-                                
-                                for item in items:
-                                    media_file = item["media_file"]
-                                    dest = day_media_dir / media_file.filename
+                            # Check all original message indices with this timestamp
+                            for orig_idx in orig_indices:
+                                if orig_idx in mappings[conv_id]:
+                                    items = mappings[conv_id][orig_idx]
+                                    # Materialize media
+                                    if not day_media_dir.exists():
+                                        ensure_directory(day_media_dir)
                                     
-                                    if safe_materialize(media_file.source_path, dest):
-                                        matched_files.append(media_file.filename)
-                                    location = f"media/{media_file.filename}"
-                                    media_locations.append(location)
-                                
-                                # Update day message
-                                day_msg["media_locations"] = media_locations
-                                day_msg["matched_media_files"] = matched_files
-                                day_msg["is_grouped"] = False
-                                day_msg["mapping_method"] = items[0]["mapping_method"]
-                                
-                                if "time_diff_seconds" in items[0]:
-                                    day_msg["time_diff_seconds"] = items[0]["time_diff_seconds"]
+                                    media_locations = []
+                                    matched_files = []
+                                    
+                                    for item in items:
+                                        media_file = item["media_file"]
+                                        dest = day_media_dir / media_file.filename
+                                        
+                                        if safe_materialize(media_file.source_path, dest):
+                                            matched_files.append(media_file.filename)
+                                        location = f"media/{media_file.filename}"
+                                        media_locations.append(location)
+                                    
+                                    # Update day message (last one wins if multiple matches)
+                                    day_msg["media_locations"] = media_locations
+                                    day_msg["matched_media_files"] = matched_files
+                                    day_msg["is_grouped"] = False
+                                    day_msg["mapping_method"] = items[0]["mapping_method"]
+                                    
+                                    if "time_diff_seconds" in items[0]:
+                                        day_msg["time_diff_seconds"] = items[0]["time_diff_seconds"]
+                                    
+                                    # Track statistics
+                                    total_mapped_items_after += len(items)
+                                    messages_with_media += 1
+                                    break  # Only apply first matching index for this timestamp
                     
                     # Clean up Created(microseconds) from messages before saving
                     clean_messages = []
@@ -374,6 +398,12 @@ def main():
 
         total_orphaned = sum(len(files) for files in orphaned_by_day.values())
         logger.info(f"Organized {len(all_days)} days with {total_orphaned} orphaned media files")
+        logger.info(f"Mapped media preservation: {total_mapped_items_before} items before -> {total_mapped_items_after} items after")
+        logger.info(f"Total messages with media in output: {messages_with_media}")
+        
+        if total_mapped_items_before != total_mapped_items_after:
+            logger.warning(f"Mapping mismatch detected! Lost {total_mapped_items_before - total_mapped_items_after} media items during day splitting")
+        
         stats.phase_times['output_organization'] = time.time() - phase_start
         stats.orphaned = total_orphaned
 

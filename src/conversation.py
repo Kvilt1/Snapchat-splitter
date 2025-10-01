@@ -104,7 +104,6 @@ def create_conversation_metadata(conv_id: str, messages: List[Dict],
         "chat_count": sum(1 for msg in messages if msg.get("Type") == "message"),
         "participants": participants_list,
         "participant_count": len(participants_list),
-        "account_owner": owner,
         "date_range": {
             "first_message": messages[0].get("Created", "N/A") if messages else "N/A",
             "last_message": messages[-1].get("Created", "N/A") if messages else "N/A"
@@ -222,7 +221,7 @@ def extract_date_from_filename(filename: str) -> Optional[str]:
 
 def generate_index_json(conversations: Dict[str, List[Dict]], friends_json: Dict, account_owner: str, days_data: Dict[str, Dict[str, List[Dict]]]) -> Dict:
     """
-    Generate master index.json with all conversation metadata.
+    Generate simplified master index.json with users and groups.
     
     Args:
         conversations: Original conversations dict
@@ -231,48 +230,73 @@ def generate_index_json(conversations: Dict[str, List[Dict]], friends_json: Dict
         days_data: Day-grouped messages
         
     Returns:
-        Index dictionary with all conversation metadata
+        Simplified index dictionary with users and groups
     """
-    index = {
-        "conversations": {},
-        "statistics": {
-            "total_conversations": len(conversations),
-            "total_messages": 0,
-            "date_range": {
-                "first_day": None,
-                "last_day": None
-            }
-        }
-    }
+    # Build friends map
+    friends_map = {}
+    for friend in friends_json.get("Friends", []):
+        friends_map[friend["Username"]] = friend.get("Display Name", friend["Username"])
+    for friend in friends_json.get("Deleted Friends", []):
+        friends_map[friend["Username"]] = friend.get("Display Name", friend["Username"])
     
-    # Get all days sorted
-    all_days = sorted(days_data.keys())
-    if all_days:
-        index["statistics"]["date_range"]["first_day"] = all_days[0]
-        index["statistics"]["date_range"]["last_day"] = all_days[-1]
+    # Collect all unique users and groups
+    all_users = set()
+    groups = []
     
-    # Create metadata for each conversation
     for conv_id, messages in conversations.items():
         if not messages:
             continue
+        
+        # Check if it's a group
+        is_group = any(msg.get("Conversation Title") for msg in messages)
+        
+        # Collect participants
+        participants = set()
+        for msg in messages:
+            sender = msg.get("From")
+            if sender:
+                participants.add(sender)
+        
+        if is_group:
+            # Get group name
+            group_name = None
+            for msg in messages:
+                if msg.get("Conversation Title"):
+                    group_name = msg["Conversation Title"]
+                    break
             
-        # Create metadata
-        metadata = create_conversation_metadata(conv_id, messages, friends_json, account_owner)
-        
-        # Find which days this conversation is active
-        days_active = []
-        for day in all_days:
-            if conv_id in days_data.get(day, {}):
-                days_active.append(day)
-        
-        # Add days_active to metadata
-        metadata["days_active"] = days_active
-        
-        # Use folder name as key
-        folder_name = get_conversation_folder_name(metadata, messages)
-        index["conversations"][folder_name] = metadata
-        
-        # Update statistics
-        index["statistics"]["total_messages"] += len(messages)
+            # Collect members (excluding owner)
+            members = sorted([p for p in participants if p != account_owner])
+            
+            groups.append({
+                "group_id": conv_id,
+                "name": group_name or conv_id,
+                "members": members
+            })
+            
+            # Add all participants to users set
+            all_users.update(participants)
+        else:
+            # Individual conversation - add recipient
+            all_users.update(participants)
+            all_users.add(conv_id)  # Add conversation ID as it might be the other person
     
-    return index
+    # Remove account owner from users
+    all_users.discard(account_owner)
+    
+    # Build users list with display names
+    users = []
+    for username in sorted(all_users):
+        users.append({
+            "username": username,
+            "display_name": friends_map.get(username, username)
+        })
+    
+    # Sort groups by name
+    groups.sort(key=lambda g: g["name"])
+    
+    return {
+        "account_owner": account_owner,
+        "users": users,
+        "groups": groups
+    }
