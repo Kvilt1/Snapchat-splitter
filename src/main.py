@@ -144,36 +144,24 @@ def _load_json_files(json_dir: Path) -> tuple[Dict, Dict, Dict]:
 
 def _process_day_media(
     day_msg: Dict,
-    ts_index: Dict[int, list],
-    mappings: Dict[str, Dict],
-    conv_id: str,
     day_media_dir: Path
 ) -> tuple[list, list, int]:
     """Process media mapping for a single day message.
     
     Args:
         day_msg: The message dictionary to process
-        ts_index: Timestamp to original message index mapping
-        mappings: Media file mappings by conversation and message index
-        conv_id: Conversation ID
         day_media_dir: Directory for the day's media files
         
     Returns:
         Tuple of (media_locations, matched_files, media_count)
     """
-    day_ts = day_msg.get("Created(microseconds)", 0)
-    orig_indices = ts_index.get(day_ts, [])
-    
     media_locations = []
     matched_files = []
     media_count = 0
     
-    # Check all original message indices with this timestamp
-    for orig_idx in orig_indices:
-        if orig_idx not in mappings[conv_id]:
-            continue
-            
-        items = mappings[conv_id][orig_idx]
+    # Extract mapped media directly from message object
+    if "__mapped_media" in day_msg:
+        items = day_msg["__mapped_media"]
         
         for item in items:
             media_file = item["media_file"]
@@ -194,7 +182,8 @@ def _process_day_media(
         if "time_diff_seconds" in items[0]:
             day_msg["time_diff_seconds"] = items[0]["time_diff_seconds"]
         
-        break  # Only apply first matching index for this timestamp
+        # Remove internal mapping field
+        del day_msg["__mapped_media"]
     
     return media_locations, matched_files, media_count
 
@@ -428,7 +417,7 @@ def main():
         merged_media_dir = temp_merged_dir / "merged_media" if temp_merged_dir.exists() else None
         media_index, index_stats = index_media_files(source_media_dir, merged_media_dir)
 
-        mappings, mapped_files, mapping_stats = map_media_to_messages(conversations, media_index)
+        mapped_files, mapping_stats = map_media_to_messages(conversations, media_index)
         stats.mapped_by_id = mapping_stats.get('mapped_by_id', 0)
         stats.mapped_by_timestamp = mapping_stats.get('mapped_by_timestamp', 0)
         stats.phase_times['media_mapping'] = time.time() - phase_start
@@ -499,24 +488,12 @@ def main():
                 conv_metadata_cache[conv_id] = metadata
                 folder_name = get_conversation_folder_name(metadata, all_messages)
                 conv_folder_names[conv_id] = sanitize_filename(folder_name)
-
-        # Build timestamp index for faster lookup (handles duplicate timestamps)
-        logger.info("Building timestamp index for media mapping...")
-        timestamp_to_index = {}
-        for conv_id, all_messages in conversations.items():
-            timestamp_to_index[conv_id] = {}
-            for orig_idx, orig_msg in enumerate(all_messages):
-                orig_ts = orig_msg.get("Created(microseconds)", 0)
-                # Store list of indices for each timestamp to handle duplicates
-                if orig_ts not in timestamp_to_index[conv_id]:
-                    timestamp_to_index[conv_id][orig_ts] = []
-                timestamp_to_index[conv_id][orig_ts].append(orig_idx)
         
-        # Calculate total mapped media before splitting
+        # Calculate total mapped media before splitting (count __mapped_media in all messages)
         total_mapped_items_before = sum(
-            len(msg_mappings) 
-            for conv_mappings in mappings.values() 
-            for msg_mappings in conv_mappings.values()
+            len(msg.get("__mapped_media", []))
+            for all_messages in conversations.values()
+            for msg in all_messages
         )
         logger.info(f"Total mapped media items before day splitting: {total_mapped_items_before}")
 
@@ -545,19 +522,15 @@ def main():
                 
                 # First, process regular media mappings
                 for conv_id, day_messages in day_conversations.items():
-                    if conv_id in mappings:
-                        # Use timestamp index for O(1) lookup
-                        ts_index = timestamp_to_index.get(conv_id, {})
+                    for day_msg in day_messages:
+                        media_locations, matched_files, media_count = _process_day_media(
+                            day_msg, day_media_dir
+                        )
                         
-                        for day_msg in day_messages:
-                            media_locations, matched_files, media_count = _process_day_media(
-                                day_msg, ts_index, mappings, conv_id, day_media_dir
-                            )
-                            
-                            if media_locations:
-                                day_total_media += media_count
-                                total_mapped_items_after += media_count
-                                messages_with_media += 1
+                        if media_locations:
+                            day_total_media += media_count
+                            total_mapped_items_after += media_count
+                            messages_with_media += 1
                 
                 # ORPHAN RESCUE: Try to rescue orphaned media BEFORE building output
                 rescued_filenames = set()
