@@ -515,6 +515,24 @@ def extract_mp4_timestamp_fast(mp4_path: Path) -> Optional[int]:
         return extract_mp4_timestamp(mp4_path)
 
 
+def has_audio_stream(video_path: Path) -> bool:
+    """
+    Check if a video file has an audio stream.
+    
+    Args:
+        video_path: Path to video file
+        
+    Returns:
+        True if video has audio stream, False otherwise
+    """
+    try:
+        probe_result = ffmpeg.probe(str(video_path))
+        return any(stream['codec_type'] == 'audio' for stream in probe_result['streams'])
+    except (ffmpeg.Error, KeyError, Exception) as e:
+        logger.debug(f"Could not detect audio stream for {video_path}: {e}")
+        return False
+
+
 def build_timestamp_index(conversations: Dict[str, List]) -> Tuple[List[int], Dict[int, List[Tuple]]]:
     """
     Build optimized index for O(log n) timestamp-based media mapping.

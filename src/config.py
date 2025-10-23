@@ -65,6 +65,7 @@ class Stats:
     # Mapping stats
     mapped_by_id: int = 0
     mapped_by_timestamp: int = 0
+    rescued_orphans: int = 0
     orphaned: int = 0
 
     # Timing

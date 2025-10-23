@@ -9,7 +9,7 @@ import time
 import signal
 import atexit
 from pathlib import Path
-from typing import Dict, Set
+from typing import Dict, Set, List, Any
 from collections import defaultdict
 
 from config import (
@@ -21,6 +21,7 @@ from config import (
     sanitize_filename,
     safe_materialize,
     get_media_type,
+    MediaFile,
     Stats,
     logger
 )
@@ -29,7 +30,8 @@ from tqdm import tqdm
 from media_processing import (
     merge_overlay_pairs,
     index_media_files,
-    map_media_to_messages
+    map_media_to_messages,
+    has_audio_stream
 )
 
 from conversation import (
@@ -197,6 +199,108 @@ def _process_day_media(
     return media_locations, matched_files, media_count
 
 
+def _rescue_orphaned_media(
+    orphaned_media: List[MediaFile],
+    day_conversations: Dict[str, List[Dict]],
+    day_media_dir: Path
+) -> tuple[Set[str], Dict[str, Any]]:
+    """
+    Rescue orphaned media when there's exactly one unambiguous match.
+    
+    Args:
+        orphaned_media: List of orphaned MediaFile objects for this day
+        day_conversations: Conversations for this day {conv_id: [messages]}
+        day_media_dir: Directory for the day's media files
+        
+    Returns:
+        (rescued_filenames, rescue_metadata) - rescued files and their mapping details
+    """
+    if not orphaned_media:
+        return set(), {}
+    
+    # Build filename -> MediaFile lookup
+    media_lookup = {mf.filename: mf for mf in orphaned_media}
+    
+    # Classify orphaned media by compatible message types
+    orphan_by_type = {}  # {filename: [compatible_types]}
+    
+    for media_file in orphaned_media:
+        ext = media_file.source_path.suffix.lower()
+        compatible_types = []
+        
+        if ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']:
+            # Image files can match IMAGE or MEDIA
+            compatible_types = ['IMAGE', 'MEDIA']
+        elif ext in ['.mp4', '.mov', '.avi', '.mkv', '.webm']:
+            # Video files: check for audio
+            has_audio = has_audio_stream(media_file.source_path)
+            if has_audio:
+                # Video with audio can match VIDEO or MEDIA
+                compatible_types = ['VIDEO', 'MEDIA']
+            else:
+                # Video without audio can only match NOTE
+                compatible_types = ['NOTE']
+        
+        if compatible_types:
+            orphan_by_type[media_file.filename] = compatible_types
+    
+    # Find messages without media in this day
+    messages_by_type = {}  # {media_type: [(conv_id, msg_idx, message)]}
+    
+    for conv_id, messages in day_conversations.items():
+        for msg_idx, msg in enumerate(messages):
+            # Skip messages that already have media
+            if msg.get('media_locations') or msg.get('matched_media_files'):
+                continue
+            
+            media_type = msg.get('Media Type', '')
+            if media_type in ['IMAGE', 'VIDEO', 'MEDIA', 'NOTE']:
+                if media_type not in messages_by_type:
+                    messages_by_type[media_type] = []
+                messages_by_type[media_type].append((conv_id, msg_idx, msg))
+    
+    # Find unambiguous matches
+    rescued = {}  # {filename: (conv_id, msg_idx, media_type)}
+    
+    for filename, compatible_types in orphan_by_type.items():
+        # Count how many messages of each compatible type exist
+        eligible_messages = []
+        for media_type in compatible_types:
+            if media_type in messages_by_type:
+                eligible_messages.extend([(conv_id, msg_idx, msg, media_type) 
+                                         for conv_id, msg_idx, msg in messages_by_type[media_type]])
+        
+        # Only rescue if exactly 1 eligible message exists
+        if len(eligible_messages) == 1:
+            conv_id, msg_idx, msg, media_type = eligible_messages[0]
+            rescued[filename] = (conv_id, msg_idx, media_type)
+    
+    # Apply rescues - materialize files and update messages
+    rescued_filenames = set()
+    rescue_metadata = {}
+    
+    for filename, (conv_id, msg_idx, media_type) in rescued.items():
+        media_file = media_lookup[filename]
+        # Materialize the file to the media directory
+        dest = day_media_dir / media_file.filename
+        if safe_materialize(media_file.source_path, dest):
+            # Update the message
+            msg = day_conversations[conv_id][msg_idx]
+            msg['media_locations'] = [f"media/{media_file.filename}"]
+            msg['matched_media_files'] = [media_file.filename]
+            msg['is_grouped'] = False
+            msg['mapping_method'] = 'orphan_rescue'
+            
+            rescued_filenames.add(media_file.filename)
+            rescue_metadata[media_file.filename] = {
+                'conv_id': conv_id,
+                'msg_idx': msg_idx,
+                'media_type': media_type
+            }
+    
+    return rescued_filenames, rescue_metadata
+
+
 def _log_final_summary(stats: Stats, total_time: float, output_dir: Path, index_stats: Dict) -> None:
     """Log the final processing summary with detailed statistics.
     
@@ -226,11 +330,13 @@ def _log_final_summary(stats: Stats, total_time: float, output_dir: Path, index_
     logger.info("Mapping Results:")
     logger.info(f"  - Mapped by Media ID:              {stats.mapped_by_id}")
     logger.info(f"  - Mapped by timestamp:             {stats.mapped_by_timestamp}")
-    logger.info(f"  - Total mapped:                    {total_mapped}")
+    if stats.rescued_orphans > 0:
+        logger.info(f"  - Rescued orphans (smart match):   {stats.rescued_orphans}")
+    logger.info(f"  - Total mapped:                    {total_mapped + stats.rescued_orphans}")
     logger.info(f"  - Orphaned (unmapped):             {stats.orphaned}")
 
     if total_processed > 0:
-        map_pct = (total_mapped / total_processed) * 100
+        map_pct = ((total_mapped + stats.rescued_orphans) / total_processed) * 100
         logger.info(f"  - Mapping success rate:            {map_pct:.1f}%")
 
     logger.info("")
@@ -417,6 +523,7 @@ def main():
         # Process each day and track mapping preservation
         total_mapped_items_after = 0
         messages_with_media = 0
+        total_rescued = 0
         
         with tqdm(total=len(all_days), desc="Processing days", unit="days") as day_pbar:
             for day in all_days:
@@ -436,12 +543,8 @@ def main():
                 day_total_messages = 0
                 day_total_media = 0
                 
+                # First, process regular media mappings
                 for conv_id, day_messages in day_conversations.items():
-                    # Get metadata for this conversation
-                    all_messages = conversations[conv_id]
-                    metadata = conv_metadata_cache.get(conv_id)
-                    folder_name = conv_folder_names.get(conv_id)
-                    
                     if conv_id in mappings:
                         # Use timestamp index for O(1) lookup
                         ts_index = timestamp_to_index.get(conv_id, {})
@@ -455,6 +558,30 @@ def main():
                                 day_total_media += media_count
                                 total_mapped_items_after += media_count
                                 messages_with_media += 1
+                
+                # ORPHAN RESCUE: Try to rescue orphaned media BEFORE building output
+                rescued_filenames = set()
+                if day in orphaned_by_day:
+                    rescued_filenames, rescue_metadata = _rescue_orphaned_media(
+                        orphaned_by_day[day],
+                        day_conversations,
+                        day_media_dir
+                    )
+                    
+                    if rescued_filenames:
+                        logger.info(f"  Day {day}: Rescued {len(rescued_filenames)} orphaned media file(s)")
+                        # Update stats
+                        day_total_media += len(rescued_filenames)
+                        total_mapped_items_after += len(rescued_filenames)
+                        total_rescued += len(rescued_filenames)
+                        messages_with_media += len(rescued_filenames)
+                
+                # Now build conversation output with all media (including rescued)
+                for conv_id, day_messages in day_conversations.items():
+                    # Get metadata for this conversation
+                    all_messages = conversations[conv_id]
+                    metadata = conv_metadata_cache.get(conv_id)
+                    folder_name = conv_folder_names.get(conv_id)
                     
                     # Clean up Created(microseconds) from messages before saving
                     clean_messages = [
@@ -480,12 +607,16 @@ def main():
                     conversations_output.append(conversation_entry)
                     day_total_messages += len(clean_messages)
                 
-                # Handle orphaned media for this day
+                # Handle remaining orphaned media for this day
                 orphaned_media_list = []
                 if day in orphaned_by_day:
                     ensure_directory(orphaned_dir)
                     
                     for media_file in orphaned_by_day[day]:
+                        # Skip rescued files
+                        if media_file.filename in rescued_filenames:
+                            continue
+                        
                         safe_materialize(media_file.source_path, orphaned_dir / media_file.filename)
                         
                         # Determine media type from extension
@@ -520,7 +651,12 @@ def main():
                 day_pbar.update(1)
 
         total_orphaned = sum(len(files) for files in orphaned_by_day.values())
-        logger.info(f"Organized {len(all_days)} days with {total_orphaned} orphaned media files")
+        # Subtract rescued files from orphaned count
+        final_orphaned = total_orphaned - total_rescued
+        
+        logger.info(f"Organized {len(all_days)} days with {final_orphaned} orphaned media files")
+        if total_rescued > 0:
+            logger.info(f"Rescued {total_rescued} orphaned media files using smart matching")
         logger.info(f"Mapped media preservation: {total_mapped_items_before} items before -> {total_mapped_items_after} items after")
         logger.info(f"Total messages with media in output: {messages_with_media}")
         
@@ -528,7 +664,8 @@ def main():
             logger.warning(f"Mapping mismatch detected! Lost {total_mapped_items_before - total_mapped_items_after} media items during day splitting")
         
         stats.phase_times['output_organization'] = time.time() - phase_start
-        stats.orphaned = total_orphaned
+        stats.rescued_orphans = total_rescued
+        stats.orphaned = final_orphaned
 
         # CLEANUP PHASE
         phase_start = time.time()
