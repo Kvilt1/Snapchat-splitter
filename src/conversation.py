@@ -172,6 +172,7 @@ def convert_message_timestamp(msg: Dict, remove_utc_fields: bool = True) -> Dict
 def group_messages_by_day(conversations: Dict[str, List[Dict]]) -> Dict[str, Dict[str, List[Dict]]]:
     """
     Group messages by Faroese calendar day.
+    Preserves __mapped_media field from original messages.
     
     Args:
         conversations: Dict of {conv_id: [messages]}
@@ -193,6 +194,11 @@ def group_messages_by_day(conversations: Dict[str, List[Dict]]) -> Dict[str, Dic
                 # Convert timestamp to Faroese and add to that day
                 # Keep Created(microseconds) for now for sorting, remove it later when writing
                 msg_copy = msg.copy()
+                
+                # Preserve __mapped_media field if it exists (shallow copy is fine)
+                if "__mapped_media" in msg:
+                    msg_copy["__mapped_media"] = msg["__mapped_media"]
+                
                 msg_copy = convert_message_timestamp(msg_copy, remove_utc_fields=False)
                 days[faroese_date][conv_id].append(msg_copy)
     

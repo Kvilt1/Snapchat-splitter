@@ -533,37 +533,17 @@ def has_audio_stream(video_path: Path) -> bool:
         return False
 
 
-def build_timestamp_index(conversations: Dict[str, List]) -> Tuple[List[int], Dict[int, List[Tuple]]]:
-    """
-    Build optimized index for O(log n) timestamp-based media mapping.
-    
-    Returns:
-        sorted_timestamps: Sorted list of all message timestamps
-        timestamp_to_messages: Dict mapping timestamp to list of (conv_id, msg_idx)
-    """
-    timestamp_to_messages = defaultdict(list)
-    
-    for conv_id, messages in conversations.items():
-        for i, msg in enumerate(messages):
-            ts = int(msg.get("Created(microseconds)", 0))
-            if ts > 0:
-                timestamp_to_messages[ts].append((conv_id, i))
-    
-    # Sort timestamps for binary search
-    sorted_timestamps = sorted(timestamp_to_messages.keys())
-    
-    return sorted_timestamps, timestamp_to_messages
 
 
 def find_timestamp_matches(media_timestamp: int, 
                           sorted_timestamps: List[int],
-                          timestamp_to_messages: Dict[int, List[Tuple]],
-                          threshold_ms: int) -> List[Tuple[str, int, int, int]]:
+                          timestamp_to_messages: Dict[int, List[Dict]],
+                          threshold_ms: int) -> List[Tuple[Dict, int, int]]:
     """
     Use binary search to find timestamp matches in O(log n) time.
     
     Returns:
-        List of (conv_id, msg_idx, msg_ts, diff) sorted by time difference
+        List of (message, msg_ts, diff) sorted by time difference
     """
     if not media_timestamp:
         return []
@@ -580,32 +560,40 @@ def find_timestamp_matches(media_timestamp: int,
     for idx in range(left_idx, right_idx):
         ts = sorted_timestamps[idx]
         diff = abs(media_timestamp - ts)
-        for conv_id, msg_idx in timestamp_to_messages[ts]:
-            potential_matches.append((conv_id, msg_idx, ts, diff))
+        for msg in timestamp_to_messages[ts]:
+            potential_matches.append((msg, ts, diff))
     
     # Sort by time difference
-    potential_matches.sort(key=lambda x: x[3])
+    potential_matches.sort(key=lambda x: x[2])
     return potential_matches
 
-def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str, MediaFile]) -> Tuple[Dict, Set[str], Dict]:
-    """Map media files to conversation messages."""
+def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str, MediaFile]) -> Tuple[Set[str], Dict]:
+    """Map media files directly to message objects."""
     logger.info("=" * 60)
     logger.info("Starting MEDIA MAPPING phase")
     logger.info("=" * 60)
 
-    mappings = defaultdict(dict)
     mapped_files = set()
     stats = {'mapped_by_id': 0, 'mapped_by_timestamp': 0, 'fallback_snap_used': 0}
 
-    # Phase 1: Map by Media ID
-    logger.info("Phase 1: Mapping by Media ID...")
+    # Single consolidated loop: Map by Media ID AND build timestamp index
+    logger.info("Mapping by Media ID and building timestamp index...")
     
     # Count total messages for progress tracking
     total_messages = sum(len(messages) for messages in conversations.values())
     
+    # Build timestamp index while mapping by ID
+    timestamp_to_messages = defaultdict(list)
+    
     with tqdm(total=total_messages, desc="Mapping by Media ID", unit="msgs") as pbar:
         for conv_id, messages in conversations.items():
-            for i, msg in enumerate(messages):
+            for msg in messages:
+                # Build timestamp index for Phase 2
+                ts = int(msg.get("Created(microseconds)", 0))
+                if ts > 0:
+                    timestamp_to_messages[ts].append(msg)
+                
+                # Phase 1: Map by Media ID
                 media_ids_str = msg.get("Media IDs", "")
                 if not media_ids_str:
                     pbar.update(1)
@@ -622,10 +610,11 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
                     if media_id in media_index:
                         media_file = media_index[media_id]
 
-                        if i not in mappings[conv_id]:
-                            mappings[conv_id][i] = []
+                        # Map directly to message object
+                        if "__mapped_media" not in msg:
+                            msg["__mapped_media"] = []
 
-                        mappings[conv_id][i].append({
+                        msg["__mapped_media"].append({
                             "media_file": media_file,
                             "mapping_method": "media_id"
                         })
@@ -635,10 +624,10 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
                 pbar.update(1)
 
     # Phase 2: Map unmapped files by timestamp using BINARY SEARCH
-    logger.info("Phase 2: Mapping by timestamp (optimized with binary search)...")
+    logger.info("Mapping by timestamp (optimized with binary search)...")
 
-    # Build optimized timestamp index - O(n log n)
-    sorted_timestamps, timestamp_to_messages = build_timestamp_index(conversations)
+    # Sort timestamps for binary search
+    sorted_timestamps = sorted(timestamp_to_messages.keys())
     logger.debug(f"Built timestamp index with {len(sorted_timestamps)} unique timestamps")
 
     # Map unmapped files with timestamps
@@ -695,32 +684,27 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
             fallback_diff = float('inf')
             
             # Find the best available match (prioritize empty snaps)
-            for conv_id, msg_idx, msg_ts, diff in potential_matches:
-                # Get the actual message to check its type
-                if conv_id in conversations and msg_idx < len(conversations[conv_id]):
-                    msg = conversations[conv_id][msg_idx]
-                    msg_type = msg.get("Type", "")
-                    
-                    # For snap messages, check if already has media mapped
-                    if msg_type == "snap":
-                        if msg_idx in mappings[conv_id] and len(mappings[conv_id][msg_idx]) > 0:
-                            # This snap already has media - keep as fallback if no empty snaps found
-                            if fallback_match is None or diff < fallback_diff:
-                                fallback_match = (conv_id, msg_idx)
-                                fallback_diff = diff
-                            continue
-                    
-                    # This is a valid match (empty message or non-snap)
-                    best_match = (conv_id, msg_idx)
-                    min_diff = diff
-                    break
+            for msg, msg_ts, diff in potential_matches:
+                msg_type = msg.get("Type", "")
+                
+                # For snap messages, check if already has media mapped
+                if msg_type == "snap":
+                    if "__mapped_media" in msg and len(msg["__mapped_media"]) > 0:
+                        # This snap already has media - keep as fallback if no empty snaps found
+                        if fallback_match is None or diff < fallback_diff:
+                            fallback_match = msg
+                            fallback_diff = diff
+                        continue
+                
+                # This is a valid match (empty message or non-snap)
+                best_match = msg
+                min_diff = diff
+                break
             
             # If no available match found, check if we can use a locked snap to prevent orphaning
             if not best_match and fallback_match:
-                conv_id, msg_idx = fallback_match
                 # Only use fallback if it's a snap and would prevent orphaning
-                if (conv_id in conversations and msg_idx < len(conversations[conv_id]) and
-                    conversations[conv_id][msg_idx].get("Type") == "snap"):
+                if fallback_match.get("Type") == "snap":
                     best_match = fallback_match
                     min_diff = fallback_diff
                     logger.debug(f"Using locked snap as fallback for {media_file.filename} to prevent orphaning")
@@ -731,11 +715,11 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
                 stats['fallback_snap_used'] += 1
 
             if best_match and min_diff <= threshold_ms:
-                conv_id, msg_idx = best_match
-                if msg_idx not in mappings[conv_id]:
-                    mappings[conv_id][msg_idx] = []
+                # Map directly to message object
+                if "__mapped_media" not in best_match:
+                    best_match["__mapped_media"] = []
 
-                mappings[conv_id][msg_idx].append({
+                best_match["__mapped_media"].append({
                     "media_file": media_file,
                     "mapping_method": "timestamp",
                     "time_diff_seconds": round(min_diff / 1000.0, 1)
@@ -750,4 +734,4 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
         logger.info(f"Used {stats['fallback_snap_used']} fallback mappings (2nd media on snap to prevent orphaning)")
     logger.info("=" * 60)
 
-    return mappings, mapped_files, stats
+    return mapped_files, stats
