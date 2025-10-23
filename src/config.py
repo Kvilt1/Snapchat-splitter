@@ -19,16 +19,8 @@ QUICKTIME_EPOCH_ADJUSTER = 2082844800
 # Timezone configuration
 FAROESE_TZ = pytz.timezone('Atlantic/Faroe')  # Faroese Atlantic Time (UTC-1/UTC+0 with DST)
 
-# Encoding Configuration
-# Set GPU_WORKERS to override auto-detection:
-# - None: Auto-detect based on hardware (recommended)
-# - 4-8: For systems with hardware encoders (NVIDIA/AMD/Intel)
-# - 2-4: For CPU encoding
-GPU_WORKERS = None  # Auto-detect optimal worker count
-
 # Performance tuning
 USE_FAST_TIMESTAMP_EXTRACTION = True  # Use ffprobe instead of manual parsing
-WEBP_CONVERSION_WORKERS = 8  # For WebP to PNG conversion
 
 # Logging setup
 logging.basicConfig(
@@ -53,6 +45,7 @@ class MediaFile:
     timestamp: Optional[int] = None
     is_merged: bool = False
     mapping_method: Optional[str] = None
+    has_audio: Optional[bool] = None
 
 @dataclass
 class Stats:

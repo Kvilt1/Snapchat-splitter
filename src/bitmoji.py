@@ -8,7 +8,6 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
-import threading
 from typing import Dict, Set
 
 import requests
@@ -36,8 +35,6 @@ FALLBACK_AVATAR_PATH = (
 # XML namespaces for SVG parsing
 SVG_NS = {"svg": "http://www.w3.org/2000/svg", "xlink": "http://www.w3.org/1999/xlink"}
 
-_thread_local = threading.local()
-
 
 def _build_session() -> requests.Session:
     """Configure a session with retry-aware adapters and large connection pools."""
@@ -55,12 +52,8 @@ def _build_session() -> requests.Session:
     return session
 
 
-def _get_session() -> requests.Session:
-    session = getattr(_thread_local, "session", None)
-    if session is None:
-        session = _build_session()
-        _thread_local.session = session
-    return session
+# Global session (thread-safe - requests.Session objects are thread-safe)
+SESSION = _build_session()
 
 
 class FallbackGenerator:
@@ -116,8 +109,7 @@ def get_avatar(username: str) -> tuple[str, str, str]:
     """Fetch, process, and normalize a Bitmoji avatar, with fallback on failure."""
     try:
         params = {"username": username, "type": "SVG", "bitmoji": "enable"}
-        session = _get_session()
-        response = session.get("https://app.snapchat.com/web/deeplink/snapcode", params=params, timeout=10)
+        response = SESSION.get("https://app.snapchat.com/web/deeplink/snapcode", params=params, timeout=10)
         response.raise_for_status()
 
         root = ET.fromstring(response.text)

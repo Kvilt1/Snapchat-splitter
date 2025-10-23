@@ -18,7 +18,6 @@ from bisect import bisect_left, bisect_right
 from config import (
     TIMESTAMP_THRESHOLD_SECONDS,
     QUICKTIME_EPOCH_ADJUSTER,
-    GPU_WORKERS,
     ensure_directory,
     MediaFile,
     Stats
@@ -26,141 +25,13 @@ from config import (
 
 # Direct ffmpeg-python import for overlay merging
 import ffmpeg
-# PIL for WebP to PNG conversion
-from PIL import Image
-# System capability detection
-from system_utils import get_system_capabilities
 
 logger = logging.getLogger(__name__)
 
 
-def _log_system_capabilities(sys_caps, encoder_name: str, max_workers: int) -> None:
-    """Log detected system capabilities.
-    
-    Args:
-        sys_caps: SystemCapabilities object with detected hardware
-        encoder_name: Name of the selected encoder
-        max_workers: Number of parallel workers
-    """
-    logger.info("System capabilities detected:")
-    logger.info(f"  FFmpeg: {sys_caps.ffmpeg_path or 'Not found'}")
-    logger.info(f"  Encoder: {encoder_name}")
-    logger.info(f"  Workers: {max_workers}")
-
-# Cache directory for converted PNG files
-CACHE_DIR = Path(".cache")
-
-def convert_webp_to_png_optimized(input_path: Path, output_path: Path) -> bool:
-    """
-    Convert a single WebP image to PNG efficiently.
-    
-    Args:
-        input_path: Path to input WebP file
-        output_path: Path to output PNG file
-        
-    Returns:
-        bool: True if conversion successful, False otherwise
-    """
+def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path) -> bool:
+    """Merge media with overlay using libx264 (universal CPU encoder)."""
     try:
-        # Skip if PNG already exists and is newer than WebP
-        if (output_path.exists() and 
-            output_path.stat().st_mtime > input_path.stat().st_mtime):
-            return True
-            
-        # Ensure output directory exists
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Convert WebP to PNG
-        with Image.open(input_path) as img:
-            # Convert to RGB if necessary (for transparency handling)
-            if img.mode in ('RGBA', 'LA'):
-                # Keep transparency
-                img.save(output_path, 'PNG', optimize=True)
-            else:
-                # Convert to RGB for non-transparent images
-                rgb_img = img.convert('RGB')
-                rgb_img.save(output_path, 'PNG', optimize=True)
-                
-        return True
-        
-    except Exception as e:
-        logger.error(f"Failed to convert {input_path} to PNG: {e}")
-        return False
-
-def batch_convert_webp_worker(args: Tuple[Path, Path]) -> Optional[Tuple[Path, Path]]:
-    """Worker function for parallel WebP to PNG conversion."""
-    webp_path, png_path = args
-    if convert_webp_to_png_optimized(webp_path, png_path):
-        return (webp_path, png_path)
-    return None
-
-def batch_convert_webp_overlays(overlay_files: List[Path], cache_dir: Path, max_workers: int = 8) -> Dict[Path, Path]:
-    """
-    Convert multiple WebP overlay files to PNG in parallel.
-    
-    Args:
-        overlay_files: List of WebP overlay file paths
-        cache_dir: Cache directory for converted PNG files
-        max_workers: Maximum number of worker threads
-        
-    Returns:
-        Dict mapping original WebP paths to converted PNG paths
-    """
-    # Filter only WebP files
-    webp_files = [f for f in overlay_files if f.suffix.lower() == '.webp']
-    
-    if not webp_files:
-        return {}
-        
-    logger.info(f"Converting {len(webp_files)} WebP overlay files to PNG...")
-    
-    # Ensure cache directory exists
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Prepare conversion operations
-    conversion_ops = []
-    path_mapping = {}
-    
-    for webp_path in webp_files:
-        # Create PNG path in cache directory
-        png_filename = webp_path.stem + '.png'
-        png_path = cache_dir / png_filename
-        conversion_ops.append((webp_path, png_path))
-        path_mapping[webp_path] = png_path
-    
-    # Execute conversions in parallel with progress bar
-    successful_conversions = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_op = {executor.submit(batch_convert_webp_worker, op): op for op in conversion_ops}
-        
-        # Progress bar for WebP conversion
-        with tqdm(total=len(conversion_ops), desc="Converting WebP overlays", unit="files", 
-                 bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]') as pbar:
-            for future in as_completed(future_to_op):
-                result = future.result()
-                if result:
-                    webp_path, png_path = result
-                    successful_conversions[webp_path] = png_path
-                pbar.update(1)
-    
-    logger.info(f"Successfully converted {len(successful_conversions)}/{len(webp_files)} WebP files to PNG")
-    return successful_conversions
-
-
-def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path, 
-                     allow_overwriting: bool = True, quiet: bool = True, 
-                     encoder_name: Optional[str] = None,
-                     encoder_options: Optional[Dict] = None) -> bool:
-    """
-    Merge media with overlay using hardware acceleration when available.
-    Returns True on success, False on failure.
-    """
-    try:
-        # Get system capabilities if not provided
-        if encoder_name is None or encoder_options is None:
-            sys_caps = get_system_capabilities()
-            encoder_name, encoder_options = sys_caps.get_optimal_encoder()
-        
         vid = ffmpeg.input(str(media_file))
         overlay_img = ffmpeg.input(str(overlay_file))
         
@@ -172,13 +43,16 @@ def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path,
         try:
             probe_result = ffmpeg.probe(str(media_file))
             has_audio = any(stream['codec_type'] == 'audio' for stream in probe_result['streams'])
-        except (ffmpeg.Error, KeyError, Exception) as e:
-            logger.debug(f"Could not detect audio stream for {media_file.name}: {e}")
+        except Exception:
             has_audio = False
         
-        # Use detected encoder options
-        output_options = encoder_options.copy()
-        output_options['map_metadata'] = 0
+        # Use libx264 with ultrafast preset
+        output_options = {
+            'vcodec': 'libx264',
+            'preset': 'ultrafast',
+            'crf': '23',
+            'map_metadata': 0
+        }
         
         # Create output with or without audio
         if has_audio:
@@ -186,43 +60,15 @@ def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path,
         else:
             output_node = ffmpeg.output(overlay_video, str(output_path), **output_options)
         
-        if allow_overwriting:
-            output_node = output_node.overwrite_output()
-        
-        output_node.run(quiet=quiet)
+        output_node.overwrite_output().run(quiet=True)
         return True
         
     except ffmpeg.Error as err:
-        stderr_output = err.stderr.decode('utf-8') if err.stderr else 'No stderr available'
-        
-        # If hardware encoding fails, fallback to CPU
-        if encoder_name != 'libx264' and ('nvenc' in str(err).lower() or 
-                                           'qsv' in str(err).lower() or
-                                           'vaapi' in str(err).lower() or
-                                           'videotoolbox' in str(err).lower()):
-            logger.warning(f"Hardware encoding ({encoder_name}) failed for {media_file.name}, falling back to CPU")
-            cpu_options = {
-                'vcodec': 'libx264',
-                'preset': 'ultrafast',
-                'crf': '23',
-            }
-            return run_ffmpeg_merge(media_file, overlay_file, output_path, 
-                                   allow_overwriting, quiet, 
-                                   encoder_name='libx264', 
-                                   encoder_options=cpu_options)
-        
-        logger.error(f"ffmpeg error: {stderr_output}")
+        logger.error(f"ffmpeg error: {err.stderr.decode('utf-8') if err.stderr else 'No stderr'}")
         return False
-        
     except Exception as e:
         logger.error(f"Error merging {media_file.name}: {e}")
         return False
-def overlay_merge_single(media_file: Path, overlay_file: Path, output_path: Path) -> bool:
-    """
-    Merge media with overlay using direct ffmpeg-python.
-    Optimized for speed - skips timestamp preservation.
-    """
-    return run_ffmpeg_merge(media_file, overlay_file, output_path)
 
 def calculate_file_hash(file_path: Path) -> Optional[str]:
     """Calculate MD5 hash of file."""
@@ -240,8 +86,7 @@ def parallel_merge_worker(args: Tuple[Path, Path, Path]) -> Optional[Tuple[str, 
     """Worker function for parallel overlay merging."""
     media_file, overlay_file, output_file = args
     
-    # Single-run optimization - no caching needed
-    if overlay_merge_single(media_file, overlay_file, output_file):
+    if run_ffmpeg_merge(media_file, overlay_file, output_file):
         return (media_file.name, overlay_file.name)
     return None
 
@@ -251,29 +96,18 @@ def merge_overlay_pairs(source_dir: Path, output_dir: Path, max_workers: int = N
     logger.info("Starting PARALLEL OVERLAY MERGING phase")
     logger.info("=" * 60)
     
-    # Get system capabilities
-    sys_caps = get_system_capabilities()
-    logger.info("\n" + "=" * 60)
-    logger.info("SYSTEM CAPABILITIES:")
-    logger.info("=" * 60)
-    logger.info(sys_caps.get_capabilities_summary())
-    logger.info("=" * 60 + "\n")
-
+    # Use simple default for workers
     if max_workers is None:
-        # Check config first, then auto-detect based on system
-        max_workers = sys_caps.get_optimal_workers(GPU_WORKERS)
+        max_workers = 4
     
     logger.info(f"Using {max_workers} parallel workers for encoding")
 
     merged_dir = output_dir / "merged_media"
     ensure_directory(merged_dir)
     
-    # Setup cache directory for WebP conversion
-    cache_dir = CACHE_DIR / "converted_overlays"
-    
     # Collect all merge operations
     merge_operations = []
-    stats = {'total_media': 0, 'total_overlay': 0, 'total_merged': 0, 'webp_converted': 0}
+    stats = {'total_media': 0, 'total_overlay': 0, 'total_merged': 0}
     
     # Group files by date
     files_by_date = defaultdict(lambda: {"media": [], "overlay": []})
@@ -306,8 +140,9 @@ def merge_overlay_pairs(source_dir: Path, output_dir: Path, max_workers: int = N
         if not media_files or not overlay_files:
             continue
             
+        # Check file size first (fast), then hash if needed (slow)
         if len(overlay_files) == 1 or (len(overlay_files) > 1 and 
-            len(set(calculate_file_hash(f) for f in overlay_files)) == 1):
+            len(set(f.stat().st_size for f in overlay_files)) == 1):
             # Single/multipart: use first overlay for all media
             overlay = overlay_files[0]
             for media in media_files:
@@ -319,34 +154,15 @@ def merge_overlay_pairs(source_dir: Path, output_dir: Path, max_workers: int = N
     
     logger.info(f"Found {len(merge_operations)} merge operations to process in parallel")
     
-    # WEBP CONVERSION PHASE
-    # Extract all unique overlay files that are WebP
-    overlay_files = list(set(op[1] for op in merge_operations))
-    webp_conversion_map = batch_convert_webp_overlays(overlay_files, cache_dir, max_workers)
-    
-    # Update merge operations to use PNG files where available
-    updated_operations = []
-    for media_file, overlay_file, output_file in merge_operations:
-        if overlay_file in webp_conversion_map:
-            # Use converted PNG instead of original WebP
-            updated_operations.append((media_file, webp_conversion_map[overlay_file], output_file))
-            stats['webp_converted'] += 1
-        else:
-            # Use original overlay file
-            updated_operations.append((media_file, overlay_file, output_file))
-    
-    merge_operations = updated_operations
+    # ffmpeg can read WebP directly, no need to convert
     merged_files = set()
     
     # Execute operations in parallel with progress bar
-    encoder_name, _ = sys_caps.get_optimal_encoder()
-    encoder_display = encoder_name.upper().replace('_', ' ')
-    
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_op = {executor.submit(parallel_merge_worker, op): op for op in merge_operations}
         
         # Progress bar for overlay merging
-        with tqdm(total=len(merge_operations), desc=f"Encoding ({encoder_display})", unit="videos",
+        with tqdm(total=len(merge_operations), desc="Encoding (libx264)", unit="videos",
                  bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
             for future in as_completed(future_to_op):
                 result = future.result()
@@ -358,8 +174,6 @@ def merge_overlay_pairs(source_dir: Path, output_dir: Path, max_workers: int = N
                 pbar.update(1)
 
     logger.info(f"Completed {stats['total_merged']}/{len(merge_operations)} merge operations")
-    if stats['webp_converted'] > 0:
-        logger.info(f"Converted {stats['webp_converted']} WebP overlays to PNG for better compatibility")
     logger.info("=" * 60)
     return merged_files, stats
 
@@ -407,12 +221,18 @@ def index_media_files(source_dir: Path, merged_dir: Optional[Path] = None) -> Tu
         for item in source_files:
             stats['total_files'] += 1
             media_id = extract_media_id(item.name)
+            
+            # Probe for audio during indexing (for video files)
+            has_audio = None
+            if item.suffix.lower() in ['.mp4', '.mov', '.avi', '.mkv', '.webm']:
+                has_audio = has_audio_stream(item)
 
             media_file = MediaFile(
                 filename=item.name,
                 source_path=item,
                 media_id=media_id,
-                timestamp=None  # Extract lazily only when needed for timestamp mapping
+                timestamp=None,  # Extract lazily only when needed for timestamp mapping
+                has_audio=has_audio
             )
 
             if media_id:
@@ -425,13 +245,19 @@ def index_media_files(source_dir: Path, merged_dir: Optional[Path] = None) -> Tu
         for item in merged_files:
             stats['total_files'] += 1
             media_id = extract_media_id(item.name)
+            
+            # Probe for audio during indexing (for video files)
+            has_audio = None
+            if item.suffix.lower() in ['.mp4', '.mov', '.avi', '.mkv', '.webm']:
+                has_audio = has_audio_stream(item)
 
             media_file = MediaFile(
                 filename=item.name,
                 source_path=item,
                 media_id=media_id,
                 timestamp=None,  # Extract lazily only when needed for timestamp mapping
-                is_merged=True
+                is_merged=True,
+                has_audio=has_audio
             )
 
             if media_id:
@@ -445,54 +271,15 @@ def index_media_files(source_dir: Path, merged_dir: Optional[Path] = None) -> Tu
 
     return media_index, stats
 
-def extract_mp4_timestamp(mp4_path: Path) -> Optional[int]:
-    """Extract creation timestamp from MP4 file."""
-    try:
-        with open(mp4_path, "rb") as f:
-            while True:
-                header = f.read(8)
-                if not header:
-                    return None
-
-                size = struct.unpack('>I', header[0:4])[0]
-                atom_type = header[4:8]
-
-                if atom_type == b'moov':
-                    mvhd = f.read(8)
-                    if mvhd[4:8] == b'mvhd':
-                        version = f.read(1)[0]
-                        f.seek(3, 1)
-
-                        if version == 0:
-                            creation_time = struct.unpack('>I', f.read(4))[0]
-                        else:
-                            creation_time = struct.unpack('>Q', f.read(8))[0]
-
-                        return (creation_time - QUICKTIME_EPOCH_ADJUSTER) * 1000
-                    return None
-
-                if size == 1:
-                    f.seek(struct.unpack('>Q', f.read(8))[0] - 16, 1)
-                else:
-                    f.seek(size - 8, 1)
-    except (OSError, IOError, struct.error) as e:
-        logger.debug(f"Could not extract MP4 timestamp from {mp4_path}: {e}")
-        return None
-
-
 def extract_mp4_timestamp_fast(mp4_path: Path) -> Optional[int]:
-    """
-    Extract creation timestamp using ffprobe (faster than manual parsing).
-    Falls back to manual extraction if ffprobe fails.
-    """
+    """Extract creation timestamp using ffprobe."""
     try:
         probe = ffmpeg.probe(str(mp4_path))
         
-        # Try to get creation_time from format tags
+        # Try format tags
         if 'format' in probe and 'tags' in probe['format']:
             creation_time = probe['format']['tags'].get('creation_time')
             if creation_time:
-                # Parse ISO timestamp
                 dt = datetime.fromisoformat(creation_time.replace('Z', '+00:00'))
                 return int(dt.timestamp() * 1000)
         
@@ -500,19 +287,16 @@ def extract_mp4_timestamp_fast(mp4_path: Path) -> Optional[int]:
         if 'streams' in probe:
             for stream in probe['streams']:
                 if stream.get('codec_type') == 'video':
-                    tags = stream.get('tags', {})
-                    creation_time = tags.get('creation_time')
+                    creation_time = stream.get('tags', {}).get('creation_time')
                     if creation_time:
                         dt = datetime.fromisoformat(creation_time.replace('Z', '+00:00'))
                         return int(dt.timestamp() * 1000)
         
-        # Fallback to manual extraction
-        return extract_mp4_timestamp(mp4_path)
+        return None
         
-    except (ffmpeg.Error, ValueError, KeyError) as e:
-        # Fallback to manual extraction on ffprobe failure
-        logger.debug(f"ffprobe failed for {mp4_path}, using manual extraction: {e}")
-        return extract_mp4_timestamp(mp4_path)
+    except Exception as e:
+        logger.debug(f"Could not extract timestamp from {mp4_path}: {e}")
+        return None
 
 
 def has_audio_stream(video_path: Path) -> bool:
@@ -587,13 +371,12 @@ def find_timestamp_matches(media_timestamp: int,
     potential_matches.sort(key=lambda x: x[3])
     return potential_matches
 
-def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str, MediaFile]) -> Tuple[Dict, Set[str], Dict]:
-    """Map media files to conversation messages."""
+def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str, MediaFile]) -> Tuple[Set[str], Dict]:
+    """Map media files to conversation messages by attaching directly to message dicts."""
     logger.info("=" * 60)
     logger.info("Starting MEDIA MAPPING phase")
     logger.info("=" * 60)
 
-    mappings = defaultdict(dict)
     mapped_files = set()
     stats = {'mapped_by_id': 0, 'mapped_by_timestamp': 0, 'fallback_snap_used': 0}
 
@@ -605,7 +388,7 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
     
     with tqdm(total=total_messages, desc="Mapping by Media ID", unit="msgs") as pbar:
         for conv_id, messages in conversations.items():
-            for i, msg in enumerate(messages):
+            for msg in messages:
                 media_ids_str = msg.get("Media IDs", "")
                 if not media_ids_str:
                     pbar.update(1)
@@ -622,10 +405,7 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
                     if media_id in media_index:
                         media_file = media_index[media_id]
 
-                        if i not in mappings[conv_id]:
-                            mappings[conv_id][i] = []
-
-                        mappings[conv_id][i].append({
+                        msg.setdefault('_media', []).append({
                             "media_file": media_file,
                             "mapping_method": "media_id"
                         })
@@ -703,7 +483,7 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
                     
                     # For snap messages, check if already has media mapped
                     if msg_type == "snap":
-                        if msg_idx in mappings[conv_id] and len(mappings[conv_id][msg_idx]) > 0:
+                        if msg.get('_media'):
                             # This snap already has media - keep as fallback if no empty snaps found
                             if fallback_match is None or diff < fallback_diff:
                                 fallback_match = (conv_id, msg_idx)
@@ -732,10 +512,9 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
 
             if best_match and min_diff <= threshold_ms:
                 conv_id, msg_idx = best_match
-                if msg_idx not in mappings[conv_id]:
-                    mappings[conv_id][msg_idx] = []
+                msg = conversations[conv_id][msg_idx]
 
-                mappings[conv_id][msg_idx].append({
+                msg.setdefault('_media', []).append({
                     "media_file": media_file,
                     "mapping_method": "timestamp",
                     "time_diff_seconds": round(min_diff / 1000.0, 1)
@@ -750,4 +529,4 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
         logger.info(f"Used {stats['fallback_snap_used']} fallback mappings (2nd media on snap to prevent orphaning)")
     logger.info("=" * 60)
 
-    return mappings, mapped_files, stats
+    return mapped_files, stats
