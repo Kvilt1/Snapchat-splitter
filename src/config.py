@@ -13,7 +13,7 @@ import pytz
 # Configuration
 INPUT_DIR = Path("input")
 OUTPUT_DIR = Path("output")
-TIMESTAMP_THRESHOLD_SECONDS = 60
+TIMESTAMP_THRESHOLD_SECONDS = 75  # Increased to handle Bitmoji video timing offsets
 QUICKTIME_EPOCH_ADJUSTER = 2082844800
 
 # Timezone configuration
@@ -43,17 +43,20 @@ class MediaFile:
     source_path: Path
     media_id: Optional[str] = None
     timestamp: Optional[int] = None
-    is_merged: bool = False
+    is_merged: bool = False  # Deprecated: kept for compatibility, same as is_folder
     mapping_method: Optional[str] = None
     has_audio: Optional[bool] = None
+    is_folder: bool = False  # True if source_path points to organized folder
+    video_path: Optional[Path] = None  # Path to video file inside folder
+    overlay_path: Optional[Path] = None  # Path to overlay file inside folder
 
 @dataclass
 class Stats:
     """Centralized statistics tracking."""
-    # Merge stats
+    # Organization stats (renamed from Merge stats)
     total_media: int = 0
     total_overlay: int = 0
-    total_merged: int = 0
+    total_organized: int = 0  # Renamed from total_merged
 
     # Mapping stats
     mapped_by_id: int = 0

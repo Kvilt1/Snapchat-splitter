@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # The final size of the avatar SVG
 TARGET_SIZE = 54
 # Maximum number of concurrent download threads
-MAX_WORKERS = 128
+MAX_WORKERS = 10
 # Path for the default "ghost" avatar icon
 FALLBACK_AVATAR_PATH = (
     "M27 54.06C33.48 54.06 39.48 51.78 44.16 47.94C43.32 46.68 42.36 45.78 41.34 44.94C38.22 42.48 "

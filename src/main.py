@@ -28,7 +28,7 @@ from config import (
 from tqdm import tqdm
 
 from media_processing import (
-    merge_overlay_pairs,
+    organize_overlay_pairs,
     index_media_files,
     map_media_to_messages,
     has_audio_stream
@@ -168,22 +168,26 @@ def _rescue_orphaned_media(
     orphan_by_type = {}  # {filename: [compatible_types]}
     
     for media_file in orphaned_media:
-        ext = media_file.source_path.suffix.lower()
+        # Get extension from video_path if folder, otherwise source_path
+        if media_file.is_folder:
+            ext = media_file.video_path.suffix.lower() if media_file.video_path else ''
+        else:
+            ext = media_file.source_path.suffix.lower()
+
         compatible_types = []
-        
+
         if ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']:
             # Image files can match IMAGE or MEDIA
             compatible_types = ['IMAGE', 'MEDIA']
         elif ext in ['.mp4', '.mov', '.avi', '.mkv', '.webm']:
-            # Video files: check for audio
-            has_audio = has_audio_stream(media_file.source_path)
-            if has_audio:
+            # Video files: check for audio (already stored in has_audio field)
+            if media_file.has_audio:
                 # Video with audio can match VIDEO or MEDIA
                 compatible_types = ['VIDEO', 'MEDIA']
             else:
                 # Video without audio can only match NOTE
                 compatible_types = ['NOTE']
-        
+
         if compatible_types:
             orphan_by_type[media_file.filename] = compatible_types
     
@@ -224,16 +228,27 @@ def _rescue_orphaned_media(
     
     for filename, (conv_id, msg_idx, media_type) in rescued.items():
         media_file = media_lookup[filename]
-        # Materialize the file to the media directory
-        dest = day_media_dir / media_file.filename
-        if safe_materialize(media_file.source_path, dest):
+
+        # Handle folder-based vs regular files
+        if media_file.is_folder:
+            # Copy entire folder (containing video + overlay)
+            dest_filename = media_file.filename
+            dest = day_media_dir / dest_filename
+            source = media_file.source_path
+        else:
+            # Regular file
+            dest_filename = media_file.filename
+            dest = day_media_dir / dest_filename
+            source = media_file.source_path
+
+        if safe_materialize(source, dest):
             # Update the message
             msg = day_conversations[conv_id][msg_idx]
             msg.setdefault('_media', []).append({
                 'media_file': media_file,
                 'mapping_method': 'orphan_rescue'
             })
-            
+
             rescued_filenames.add(media_file.filename)
             rescue_metadata[media_file.filename] = {
                 'conv_id': conv_id,
@@ -259,7 +274,7 @@ def _log_final_summary(stats: Stats, total_time: float, output_dir: Path, index_
 
     # Calculate totals
     total_media_discovered = stats.total_media + stats.total_overlay
-    total_processed = stats.total_merged + (index_stats.get('total_files', 0) - stats.total_merged)
+    total_processed = stats.total_organized + (index_stats.get('total_files', 0) - stats.total_organized)
     total_mapped = stats.mapped_by_id + stats.mapped_by_timestamp
 
     logger.info(f"Total media files discovered:        {total_media_discovered}")
@@ -267,7 +282,7 @@ def _log_final_summary(stats: Stats, total_time: float, output_dir: Path, index_
     if total_media_discovered > 0:
         process_pct = (total_processed / total_media_discovered) * 100
         logger.info(f"  - Processing rate:                 {process_pct:.1f}%")
-    logger.info(f"  - Merged with overlays:            {stats.total_merged}")
+    logger.info(f"  - Organized with overlays:         {stats.total_organized}")
 
     logger.info("")
     logger.info("Mapping Results:")
@@ -336,16 +351,16 @@ def main():
         logger.info(f"Processing export from: {export_dir}")
         stats.phase_times['initialization'] = time.time() - phase_start
 
-        # OVERLAY MERGING PHASE
+        # OVERLAY ORGANIZATION PHASE
         phase_start = time.time()
-        # Create a temporary directory for merged files (not in output)
-        temp_merged_dir = export_dir.parent / f"temp_merged_{int(time.time())}"
-        register_temp_directory(temp_merged_dir)  # Register for cleanup
-        merged_files, merge_stats = merge_overlay_pairs(source_media_dir, temp_merged_dir)
-        stats.total_media = merge_stats.get('total_media', 0)
-        stats.total_overlay = merge_stats.get('total_overlay', 0)
-        stats.total_merged = merge_stats.get('total_merged', 0)
-        stats.phase_times['overlay_merging'] = time.time() - phase_start
+        # Create a temporary directory for organized files (not in output)
+        temp_organized_dir = export_dir.parent / f"temp_organized_{int(time.time())}"
+        register_temp_directory(temp_organized_dir)  # Register for cleanup
+        organized_files, organize_stats = organize_overlay_pairs(source_media_dir, temp_organized_dir)
+        stats.total_media = organize_stats.get('total_media', 0)
+        stats.total_overlay = organize_stats.get('total_overlay', 0)
+        stats.total_organized = organize_stats.get('total_organized', 0)
+        stats.phase_times['overlay_organization'] = time.time() - phase_start
 
         # DATA LOADING PHASE
         phase_start = time.time()
@@ -367,9 +382,9 @@ def main():
 
         # MEDIA INDEXING AND MAPPING PHASE
         phase_start = time.time()
-        # Index both source media and the merged media subdirectory
-        merged_media_dir = temp_merged_dir / "merged_media" if temp_merged_dir.exists() else None
-        media_index, index_stats = index_media_files(source_media_dir, merged_media_dir)
+        # Index both source media and the organized media subdirectory
+        organized_media_dir = temp_organized_dir / "organized_media" if temp_organized_dir.exists() else None
+        media_index, index_stats = index_media_files(source_media_dir, organized_media_dir)
 
         mapped_files, mapping_stats = map_media_to_messages(conversations, media_index)
         stats.mapped_by_id = mapping_stats.get('mapped_by_id', 0)
@@ -497,11 +512,22 @@ def main():
                             
                             for item in msg['_media']:
                                 media_file = item['media_file']
-                                dest = day_media_dir / media_file.filename
-                                
-                                if safe_materialize(media_file.source_path, dest):
-                                    matched_files.append(media_file.filename)
-                                media_locations.append(f"media/{media_file.filename}")
+
+                                # Handle folder-based vs regular files
+                                if media_file.is_folder:
+                                    # Copy entire folder (containing video + overlay)
+                                    dest_filename = media_file.filename
+                                    dest = day_media_dir / dest_filename
+                                    source = media_file.source_path
+                                else:
+                                    # Regular file
+                                    dest_filename = media_file.filename
+                                    dest = day_media_dir / dest_filename
+                                    source = media_file.source_path
+
+                                if safe_materialize(source, dest):
+                                    matched_files.append(dest_filename)
+                                media_locations.append(f"media/{dest_filename}")
                             
                             msg['media_locations'] = media_locations
                             msg['matched_media_files'] = matched_files

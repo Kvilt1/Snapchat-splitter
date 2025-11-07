@@ -29,153 +29,127 @@ import ffmpeg
 logger = logging.getLogger(__name__)
 
 
-def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path) -> bool:
-    """Merge media with overlay using libx264 (universal CPU encoder)."""
+def create_media_folder(media_file: Path, overlay_file: Path, output_dir: Path) -> bool:
+    """
+    Create folder structure containing video + overlay.
+
+    Structure:
+    output_dir/
+      └── {media_filename}/
+          ├── video{.ext}
+          └── overlay{.ext}
+
+    Returns:
+        True if folder created successfully, False otherwise.
+    """
     try:
-        vid = ffmpeg.input(str(media_file))
-        overlay_img = ffmpeg.input(str(overlay_file))
-        
-        # Scale overlay to match video height
-        scaled = overlay_img.filter("scale", "-1", "rh")
-        overlay_video = vid.overlay(scaled, eof_action="repeat")
-        
-        # Check for audio stream
-        try:
-            probe_result = ffmpeg.probe(str(media_file))
-            has_audio = any(stream['codec_type'] == 'audio' for stream in probe_result['streams'])
-        except Exception:
-            has_audio = False
-        
-        # Use libx264 with ultrafast preset
-        output_options = {
-            'vcodec': 'libx264',
-            'preset': 'ultrafast',
-            'crf': '23',
-            'map_metadata': 0
-        }
-        
-        # Create output with or without audio
-        if has_audio:
-            output_node = ffmpeg.output(overlay_video, vid.audio, str(output_path), **output_options)
-        else:
-            output_node = ffmpeg.output(overlay_video, str(output_path), **output_options)
-        
-        output_node.overwrite_output().run(quiet=True)
+        # Extract base name (without extension)
+        folder_name = media_file.stem
+        folder_path = output_dir / folder_name
+
+        # Create folder
+        ensure_directory(folder_path)
+
+        # Copy video with generic name
+        video_dest = folder_path / f"video{media_file.suffix}"
+        shutil.copy2(media_file, video_dest)
+
+        # Copy overlay with generic name
+        overlay_dest = folder_path / f"overlay{overlay_file.suffix}"
+        shutil.copy2(overlay_file, overlay_dest)
+
         return True
-        
-    except ffmpeg.Error as err:
-        logger.error(f"ffmpeg error: {err.stderr.decode('utf-8') if err.stderr else 'No stderr'}")
-        return False
     except Exception as e:
-        logger.error(f"Error merging {media_file.name}: {e}")
+        logger.error(f"Error creating folder for {media_file.name}: {e}")
         return False
 
-def calculate_file_hash(file_path: Path) -> Optional[str]:
-    """Calculate MD5 hash of file."""
-    try:
-        with open(file_path, 'rb') as f:
-            return hashlib.md5(f.read()).hexdigest()
-    except (OSError, IOError) as e:
-        logger.debug(f"Could not hash file {file_path}: {e}")
-        return None
 
-
-
-
-def parallel_merge_worker(args: Tuple[Path, Path, Path]) -> Optional[Tuple[str, str]]:
-    """Worker function for parallel overlay merging."""
-    media_file, overlay_file, output_file = args
-    
-    if run_ffmpeg_merge(media_file, overlay_file, output_file):
-        return (media_file.name, overlay_file.name)
-    return None
-
-def merge_overlay_pairs(source_dir: Path, output_dir: Path, max_workers: int = None) -> Tuple[Set[str], Dict[str, Any]]:
-    """Find and merge media/overlay pairs using parallel processing."""
+def organize_overlay_pairs(source_dir: Path, output_dir: Path) -> Tuple[Set[str], Dict[str, Any]]:
+    """Create folders containing video + overlay pairs instead of merging."""
     logger.info("=" * 60)
-    logger.info("Starting PARALLEL OVERLAY MERGING phase")
+    logger.info("Starting OVERLAY ORGANIZATION phase")
     logger.info("=" * 60)
-    
-    # Use simple default for workers
-    if max_workers is None:
-        max_workers = 4
-    
-    logger.info(f"Using {max_workers} parallel workers for encoding")
 
-    merged_dir = output_dir / "merged_media"
-    ensure_directory(merged_dir)
-    
-    # Collect all merge operations
-    merge_operations = []
-    stats = {'total_media': 0, 'total_overlay': 0, 'total_merged': 0}
-    
+    organized_dir = output_dir / "organized_media"
+    ensure_directory(organized_dir)
+
+    stats = {'total_media': 0, 'total_overlay': 0, 'total_organized': 0}
+    organized_files = set()
+
     # Group files by date
     files_by_date = defaultdict(lambda: {"media": [], "overlay": []})
     for file_path in source_dir.iterdir():
         if not file_path.is_file():
             continue
-        
+
         match = re.match(r"(\d{4}-\d{2}-\d{2})", file_path.name)
         if not match:
             continue
-            
+
         date_str = match.group(1)
         name_lower = file_path.name.lower()
-        
-        if "thumbnail" in name_lower or "media~zip-" in file_path.name:
+
+        if "thumbnail" in name_lower:
             continue
-            
-        if "_media~" in file_path.name:
+
+        # Include both _media~ and media~zip- patterns
+        if "_media~" in file_path.name or "media~zip-" in file_path.name:
             files_by_date[date_str]["media"].append(file_path)
             stats['total_media'] += 1
         elif "_overlay~" in file_path.name:
             files_by_date[date_str]["overlay"].append(file_path)
             stats['total_overlay'] += 1
-    
-    # Collect all merge operations from all groups
-    for date_str, files in files_by_date.items():
-        media_files = sorted(files["media"], key=lambda x: x.name)
-        overlay_files = sorted(files["overlay"], key=lambda x: x.name)
-        
-        if not media_files or not overlay_files:
-            continue
-            
-        # Check file size first (fast), then hash if needed (slow)
-        if len(overlay_files) == 1 or (len(overlay_files) > 1 and 
-            len(set(f.stat().st_size for f in overlay_files)) == 1):
-            # Single/multipart: use first overlay for all media
-            overlay = overlay_files[0]
-            for media in media_files:
-                merge_operations.append((media, overlay, merged_dir / media.name))
-        else:
-            # Grouped: pair each media with its overlay
-            for media, overlay in zip(media_files, overlay_files):
-                merge_operations.append((media, overlay, merged_dir / media.name))
-    
-    logger.info(f"Found {len(merge_operations)} merge operations to process in parallel")
-    
-    # ffmpeg can read WebP directly, no need to convert
-    merged_files = set()
-    
-    # Execute operations in parallel with progress bar
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_op = {executor.submit(parallel_merge_worker, op): op for op in merge_operations}
-        
-        # Progress bar for overlay merging
-        with tqdm(total=len(merge_operations), desc="Encoding (libx264)", unit="videos",
-                 bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
-            for future in as_completed(future_to_op):
-                result = future.result()
-                if result:
-                    media_name, overlay_name = result
-                    merged_files.add(media_name)
-                    merged_files.add(overlay_name)
-                    stats['total_merged'] += 1
-                pbar.update(1)
 
-    logger.info(f"Completed {stats['total_merged']}/{len(merge_operations)} merge operations")
+    # Process each date group
+    with tqdm(total=stats['total_media'], desc="Organizing media", unit="files") as pbar:
+        for date_str, files in files_by_date.items():
+            media_files = sorted(files["media"], key=lambda x: x.name)
+            overlay_files = sorted(files["overlay"], key=lambda x: x.name)
+
+            if not media_files or not overlay_files:
+                continue
+
+            # Check file size first (fast) to determine pattern
+            if len(overlay_files) == 1 or (len(overlay_files) > 1 and
+                len(set(f.stat().st_size for f in overlay_files)) == 1):
+                # Single/multipart: use first overlay for all media
+                overlay = overlay_files[0]
+                for media in media_files:
+                    if create_media_folder(media, overlay, organized_dir):
+                        organized_files.add(media.name)
+                        organized_files.add(overlay.name)
+                        stats['total_organized'] += 1
+                    pbar.update(1)
+            else:
+                # Grouped: pair each media with its overlay
+                for media, overlay in zip(media_files, overlay_files):
+                    if create_media_folder(media, overlay, organized_dir):
+                        organized_files.add(media.name)
+                        organized_files.add(overlay.name)
+                        stats['total_organized'] += 1
+                    pbar.update(1)
+
+    logger.info(f"Organized {stats['total_organized']} media files into folders")
     logger.info("=" * 60)
-    return merged_files, stats
+    return organized_files, stats
+
+def find_video_in_folder(folder: Path) -> Optional[Path]:
+    """Find video.* file in folder."""
+    for ext in ['.mp4', '.mov', '.avi', '.mkv', '.webm']:
+        video = folder / f"video{ext}"
+        if video.exists():
+            return video
+    return None
+
+
+def find_overlay_in_folder(folder: Path) -> Optional[Path]:
+    """Find overlay.* file in folder."""
+    for ext in ['.webp', '.png', '.jpg', '.jpeg']:
+        overlay = folder / f"overlay{ext}"
+        if overlay.exists():
+            return overlay
+    return None
+
 
 def extract_media_id(filename: str) -> Optional[str]:
     """Extract media ID from filename."""
@@ -197,8 +171,8 @@ def extract_media_id(filename: str) -> Optional[str]:
 
     return None
 
-def index_media_files(source_dir: Path, merged_dir: Optional[Path] = None) -> Tuple[Dict[str, MediaFile], Dict]:
-    """Create index of all media files from source and merged directories."""
+def index_media_files(source_dir: Path, organized_dir: Optional[Path] = None) -> Tuple[Dict[str, MediaFile], Dict]:
+    """Create index of all media files from source and organized directories."""
     logger.info("=" * 60)
     logger.info("Starting MEDIA INDEXING phase")
     logger.info("=" * 60)
@@ -207,21 +181,21 @@ def index_media_files(source_dir: Path, merged_dir: Optional[Path] = None) -> Tu
     stats = {'total_files': 0, 'extracted_ids': 0}
 
     # Count total files first for progress bar
-    source_files = [f for f in source_dir.iterdir() 
+    source_files = [f for f in source_dir.iterdir()
                    if f.is_file() and "thumbnail" not in f.name.lower() and "_overlay~" not in f.name]
-    
-    merged_files = []
-    if merged_dir and merged_dir.exists():
-        merged_files = [f for f in merged_dir.iterdir() if f.is_file()]
-    
-    total_files = len(source_files) + len(merged_files)
-    
+
+    organized_folders = []
+    if organized_dir and organized_dir.exists():
+        organized_folders = [f for f in organized_dir.iterdir() if f.is_dir()]
+
+    total_items = len(source_files) + len(organized_folders)
+
     # Index source files with progress bar (timestamps extracted lazily later)
-    with tqdm(total=total_files, desc="Indexing media files", unit="files") as pbar:
+    with tqdm(total=total_items, desc="Indexing media files", unit="files") as pbar:
         for item in source_files:
             stats['total_files'] += 1
             media_id = extract_media_id(item.name)
-            
+
             # Probe for audio during indexing (for video files)
             has_audio = None
             if item.suffix.lower() in ['.mp4', '.mov', '.avi', '.mkv', '.webm']:
@@ -232,41 +206,51 @@ def index_media_files(source_dir: Path, merged_dir: Optional[Path] = None) -> Tu
                 source_path=item,
                 media_id=media_id,
                 timestamp=None,  # Extract lazily only when needed for timestamp mapping
-                has_audio=has_audio
+                has_audio=has_audio,
+                is_folder=False
             )
 
             if media_id:
                 media_index[media_id] = media_file
                 stats['extracted_ids'] += 1
-            
+
             pbar.update(1)
 
-        # Index merged files - these take precedence over source files
-        for item in merged_files:
+        # Index organized folders - these take precedence over source files
+        for folder in organized_folders:
             stats['total_files'] += 1
-            media_id = extract_media_id(item.name)
-            
-            # Probe for audio during indexing (for video files)
-            has_audio = None
-            if item.suffix.lower() in ['.mp4', '.mov', '.avi', '.mkv', '.webm']:
-                has_audio = has_audio_stream(item)
 
-            media_file = MediaFile(
-                filename=item.name,
-                source_path=item,
-                media_id=media_id,
-                timestamp=None,  # Extract lazily only when needed for timestamp mapping
-                is_merged=True,
-                has_audio=has_audio
-            )
+            # Find video file inside folder
+            video_file = find_video_in_folder(folder)
+            overlay_file = find_overlay_in_folder(folder)
 
-            if media_id:
-                media_index[media_id] = media_file  # Merged files take precedence
-                stats['extracted_ids'] += 1
-            
+            if video_file:
+                media_id = extract_media_id(folder.name)
+
+                # Probe for audio from video file
+                has_audio = None
+                if video_file.suffix.lower() in ['.mp4', '.mov', '.avi', '.mkv', '.webm']:
+                    has_audio = has_audio_stream(video_file)
+
+                media_file = MediaFile(
+                    filename=folder.name,
+                    source_path=folder,
+                    media_id=media_id,
+                    timestamp=None,  # Extract lazily only when needed for timestamp mapping
+                    is_merged=True,  # Keep for compatibility
+                    has_audio=has_audio,
+                    is_folder=True,
+                    video_path=video_file,
+                    overlay_path=overlay_file
+                )
+
+                if media_id:
+                    media_index[media_id] = media_file  # Organized folders take precedence
+                    stats['extracted_ids'] += 1
+
             pbar.update(1)
 
-    logger.info(f"Indexed {stats['total_files']} files, extracted {stats['extracted_ids']} IDs")
+    logger.info(f"Indexed {stats['total_files']} items, extracted {stats['extracted_ids']} IDs")
     logger.info("=" * 60)
 
     return media_index, stats
@@ -424,15 +408,23 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
     # Map unmapped files with timestamps
     threshold_ms = TIMESTAMP_THRESHOLD_SECONDS * 1000
     
-    # Count unmapped MP4 files (need timestamps)
-    unmapped_mp4s = [mf for mf in media_index.values() 
-                     if mf.filename not in mapped_files and mf.source_path.suffix.lower() == '.mp4']
-    
+    # Count unmapped MP4 files (need timestamps) - handle both files and folders
+    unmapped_mp4s = []
+    for mf in media_index.values():
+        if mf.filename not in mapped_files:
+            # Check if it's a folder with video or a direct MP4 file
+            if mf.is_folder and mf.video_path:
+                unmapped_mp4s.append(mf)
+            elif not mf.is_folder and mf.source_path.suffix.lower() == '.mp4':
+                unmapped_mp4s.append(mf)
+
     logger.info(f"Extracting timestamps from {len(unmapped_mp4s)} unmapped MP4 files...")
-    
+
     # Extract timestamps in parallel for unmapped MP4s only
     def extract_timestamp_worker(media_file: MediaFile) -> Tuple[str, Optional[int]]:
-        ts = extract_mp4_timestamp_fast(media_file.source_path)
+        # Use video_path if folder-based, otherwise source_path
+        video_path = media_file.video_path if media_file.is_folder else media_file.source_path
+        ts = extract_mp4_timestamp_fast(video_path)
         return (media_file.filename, ts)
     
     # Parallel timestamp extraction
