@@ -196,17 +196,11 @@ def index_media_files(source_dir: Path, organized_dir: Optional[Path] = None) ->
             stats['total_files'] += 1
             media_id = extract_media_id(item.name)
 
-            # Probe for audio during indexing (for video files)
-            has_audio = None
-            if item.suffix.lower() in ['.mp4', '.mov', '.avi', '.mkv', '.webm']:
-                has_audio = has_audio_stream(item)
-
             media_file = MediaFile(
                 filename=item.name,
                 source_path=item,
                 media_id=media_id,
                 timestamp=None,  # Extract lazily only when needed for timestamp mapping
-                has_audio=has_audio,
                 is_folder=False
             )
 
@@ -227,18 +221,12 @@ def index_media_files(source_dir: Path, organized_dir: Optional[Path] = None) ->
             if video_file:
                 media_id = extract_media_id(folder.name)
 
-                # Probe for audio from video file
-                has_audio = None
-                if video_file.suffix.lower() in ['.mp4', '.mov', '.avi', '.mkv', '.webm']:
-                    has_audio = has_audio_stream(video_file)
-
                 media_file = MediaFile(
                     filename=folder.name,
                     source_path=folder,
                     media_id=media_id,
                     timestamp=None,  # Extract lazily only when needed for timestamp mapping
                     is_merged=True,  # Keep for compatibility
-                    has_audio=has_audio,
                     is_folder=True,
                     video_path=video_file,
                     overlay_path=overlay_file
@@ -286,10 +274,10 @@ def extract_mp4_timestamp_fast(mp4_path: Path) -> Optional[int]:
 def has_audio_stream(video_path: Path) -> bool:
     """
     Check if a video file has an audio stream.
-    
+
     Args:
         video_path: Path to video file
-        
+
     Returns:
         True if video has audio stream, False otherwise
     """
@@ -299,6 +287,71 @@ def has_audio_stream(video_path: Path) -> bool:
     except (ffmpeg.Error, KeyError, Exception) as e:
         logger.debug(f"Could not detect audio stream for {video_path}: {e}")
         return False
+
+
+def has_video_stream(video_path: Path) -> bool:
+    """
+    Check if file has a video stream.
+
+    Used to distinguish voice notes (audio-only) from regular videos.
+
+    Args:
+        video_path: Path to video file
+
+    Returns:
+        True if file has video stream, False if audio-only (voice note)
+    """
+    try:
+        probe = ffmpeg.probe(str(video_path))
+        return any(s.get('codec_type') == 'video' for s in probe.get('streams', []))
+    except Exception as e:
+        logger.debug(f"Could not check video stream for {video_path}: {e}")
+        return True  # Default to video if probe fails
+
+
+def extract_media_metadata(video_path: Path) -> Tuple[Optional[int], Optional[bool]]:
+    """
+    Extract both timestamp and audio info in a single ffmpeg.probe call.
+
+    Combines logic from extract_mp4_timestamp_fast() and has_audio_stream()
+    to reduce subprocess calls by 50%.
+
+    Args:
+        video_path: Path to video file
+
+    Returns:
+        (timestamp_ms, has_audio) - both can be None if extraction fails
+    """
+    try:
+        probe = ffmpeg.probe(str(video_path))
+
+        # Extract timestamp (from extract_mp4_timestamp_fast logic)
+        timestamp = None
+        if 'format' in probe and 'tags' in probe['format']:
+            creation_time = probe['format']['tags'].get('creation_time')
+            if creation_time:
+                dt = datetime.fromisoformat(creation_time.replace('Z', '+00:00'))
+                timestamp = int(dt.timestamp() * 1000)
+
+        # Try streams if format tags didn't have timestamp
+        if not timestamp and 'streams' in probe:
+            for stream in probe['streams']:
+                if stream.get('codec_type') == 'video':
+                    creation_time = stream.get('tags', {}).get('creation_time')
+                    if creation_time:
+                        dt = datetime.fromisoformat(creation_time.replace('Z', '+00:00'))
+                        timestamp = int(dt.timestamp() * 1000)
+                        break
+
+        # Extract audio info (from has_audio_stream logic)
+        has_audio = any(stream.get('codec_type') == 'audio'
+                       for stream in probe.get('streams', []))
+
+        return timestamp, has_audio
+
+    except Exception as e:
+        logger.debug(f"Could not extract metadata from {video_path}: {e}")
+        return None, None
 
 
 def build_timestamp_index(conversations: Dict[str, List]) -> Tuple[List[int], Dict[int, List[Tuple]]]:

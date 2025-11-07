@@ -31,7 +31,7 @@ from media_processing import (
     organize_overlay_pairs,
     index_media_files,
     map_media_to_messages,
-    has_audio_stream
+    has_video_stream
 )
 
 from conversation import (
@@ -180,12 +180,14 @@ def _rescue_orphaned_media(
             # Image files can match IMAGE or MEDIA
             compatible_types = ['IMAGE', 'MEDIA']
         elif ext in ['.mp4', '.mov', '.avi', '.mkv', '.webm']:
-            # Video files: check for audio (already stored in has_audio field)
-            if media_file.has_audio:
-                # Video with audio can match VIDEO or MEDIA
+            # Lazy check - only for orphans
+            video_path = media_file.video_path if media_file.is_folder else media_file.source_path
+
+            if has_video_stream(video_path):
+                # Has video stream = regular video
                 compatible_types = ['VIDEO', 'MEDIA']
             else:
-                # Video without audio can only match NOTE
+                # No video stream = voice note (audio-only)
                 compatible_types = ['NOTE']
 
         if compatible_types:
