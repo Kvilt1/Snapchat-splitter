@@ -7,7 +7,7 @@ from collections import defaultdict
 from typing import Dict, List, Any, Optional, Set
 from pathlib import Path
 
-from config import utc_to_faroese, format_faroese_timestamp, get_faroese_date
+from src.config import utc_to_faroese, format_faroese_timestamp, get_faroese_date
 
 logger = logging.getLogger(__name__)
 

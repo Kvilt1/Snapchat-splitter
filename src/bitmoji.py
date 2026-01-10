@@ -14,7 +14,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from config import sanitize_filename
+from src.config import sanitize_filename
 
 logger = logging.getLogger(__name__)
 

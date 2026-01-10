@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from bisect import bisect_left, bisect_right
 
-from config import (
+from src.config import (
     TIMESTAMP_THRESHOLD_SECONDS,
     QUICKTIME_EPOCH_ADJUSTER,
     ensure_directory,

@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import Dict, Set, List, Any
 from collections import defaultdict
 
-from config import (
+from tqdm import tqdm
+
+from src.config import (
     INPUT_DIR,
     OUTPUT_DIR,
     ensure_directory,
@@ -25,16 +27,15 @@ from config import (
     Stats,
     logger
 )
-from tqdm import tqdm
 
-from media_processing import (
+from src.media_processing import (
     merge_overlay_pairs,
     index_media_files,
     map_media_to_messages,
     has_audio_stream
 )
 
-from conversation import (
+from src.conversation import (
     merge_conversations,
     determine_account_owner,
     create_conversation_metadata,
@@ -45,7 +46,7 @@ from conversation import (
     convert_message_timestamp
 )
 
-from bitmoji import generate_bitmoji_assets
+from src.bitmoji import generate_bitmoji_assets
 
 # Global cleanup registry
 _temp_directories = []
