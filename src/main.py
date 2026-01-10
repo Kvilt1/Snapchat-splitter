@@ -8,6 +8,7 @@ import sys
 import time
 import signal
 import atexit
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Set, List, Any
 from collections import defaultdict
@@ -329,6 +330,7 @@ def main():
     logger.info("Press Ctrl+C to stop and clean up at any time")
 
     stats = Stats()
+    bitmoji_executor = None  # Track for cleanup in error handlers
 
     try:
         # INITIALIZATION PHASE
@@ -404,29 +406,17 @@ def main():
         # Generate index.json with all conversation metadata
         logger.info("Generating index.json...")
         index_json = generate_index_json(conversations, friends_json, account_owner, days_data)
-        
-        # BITMOJI GENERATION PHASE
-        phase_start = time.time()
+
+        # Start Bitmoji generation in background (network-bound, can run while processing days)
         _log_phase_header("BITMOJI GENERATION")
-        
-        # Extract all unique usernames
+
+        # Extract all unique usernames from index_json
         all_usernames = {user["username"] for user in index_json["users"]}
-        logger.info(f"Generating Bitmoji avatars for {len(all_usernames)} users...")
-        
-        # Generate and save Bitmoji avatars
-        bitmoji_paths = generate_bitmoji_assets(all_usernames, args.output)
-        
-        # Update index.json with Bitmoji paths
-        for user in index_json["users"]:
-            username = user["username"]
-            user["bitmoji"] = bitmoji_paths.get(username)
-        
-        # Save index.json with Bitmoji paths
-        save_json(index_json, args.output / "index.json")
-        logger.info(f"Generated index.json with {len(index_json['users'])} users and {len(index_json['groups'])} groups")
-        logger.info(f"Saved {len(bitmoji_paths)} Bitmoji avatars to output/bitmoji/")
-        stats.phase_times['bitmoji_generation'] = time.time() - phase_start
-        logger.info("=" * 60)
+        logger.info(f"[Background] Starting Bitmoji generation for {len(all_usernames)} users...")
+
+        # Start bitmoji generation in background thread
+        bitmoji_executor = ThreadPoolExecutor(max_workers=1)
+        bitmoji_future = bitmoji_executor.submit(generate_bitmoji_assets, all_usernames, args.output)
 
         # Create days folder
         days_dir = args.output / "days"
@@ -608,6 +598,21 @@ def main():
         stats.rescued_orphans = total_rescued
         stats.orphaned = final_orphaned
 
+        # Wait for background Bitmoji generation to complete and update index.json
+        logger.info("Waiting for background Bitmoji generation to complete...")
+        bitmoji_paths = bitmoji_future.result()  # Wait for completion
+        bitmoji_executor.shutdown(wait=True)
+        logger.info(f"✅ [Bitmoji Generated] Saved {len(bitmoji_paths)} avatars to output/bitmoji/")
+
+        # Update index.json with Bitmoji paths
+        for user in index_json["users"]:
+            username = user["username"]
+            user["bitmoji"] = bitmoji_paths.get(username)
+
+        # Save final index.json with Bitmoji paths
+        save_json(index_json, args.output / "index.json")
+        logger.info(f"Updated index.json with Bitmoji paths")
+
         # CLEANUP PHASE
         phase_start = time.time()
         _log_phase_header("CLEANUP")
@@ -627,11 +632,15 @@ def main():
         logger.error("=" * 60)
         logger.error(f"ERROR: {e}")
         logger.error("=" * 60)
+        if bitmoji_executor:
+            bitmoji_executor.shutdown(wait=False)
         cleanup_temp_directories()
         return 1
     except Exception as e:
         # Unexpected errors - log with traceback
         logger.exception("Unexpected error occurred")
+        if bitmoji_executor:
+            bitmoji_executor.shutdown(wait=False)
         cleanup_temp_directories()
         return 1
 
