@@ -125,9 +125,9 @@ def get_avatar(username: str) -> tuple[str, str, str]:
             raise ValueError("No href attribute found on <image> element.")
 
         clean_svg = (
-            f'<svg viewBox="0 0 {TARGET_SIZE} {TARGET_SIZE}" xmlns="http://www.w3.org/2000/svg" '
+            f'<svg viewBox="0 0 {TARGET_AVATAR_SIZE} {TARGET_AVATAR_SIZE}" xmlns="http://www.w3.org/2000/svg" '
             f'xmlns:xlink="http://www.w3.org/1999/xlink">'
-            f'<image href="{href}" x="0" y="0" width="{TARGET_SIZE}" height="{TARGET_SIZE}"/>'
+            f'<image href="{href}" x="0" y="0" width="{TARGET_AVATAR_SIZE}" height="{TARGET_AVATAR_SIZE}"/>'
             '</svg>'
         )
         return username, clean_svg, "success"
