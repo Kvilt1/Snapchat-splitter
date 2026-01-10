@@ -48,7 +48,8 @@ def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path) ->
         try:
             probe_result = ffmpeg.probe(str(media_file))
             has_audio = any(stream['codec_type'] == 'audio' for stream in probe_result['streams'])
-        except Exception:
+        except (ffmpeg.Error, KeyError, OSError) as e:
+            logger.debug(f"Could not probe audio stream for {media_file}: {e}")
             has_audio = False
         
         # Use libx264 with ultrafast preset
@@ -71,7 +72,7 @@ def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path) ->
     except ffmpeg.Error as err:
         logger.error(f"ffmpeg error: {err.stderr.decode('utf-8') if err.stderr else 'No stderr'}")
         return False
-    except Exception as e:
+    except (OSError, IOError, ValueError) as e:
         logger.error(f"Error merging {media_file.name}: {e}")
         return False
 
@@ -298,8 +299,8 @@ def extract_mp4_timestamp_fast(mp4_path: Path) -> Optional[int]:
                         return int(dt.timestamp() * 1000)
         
         return None
-        
-    except Exception as e:
+
+    except (ffmpeg.Error, ValueError, KeyError, OSError) as e:
         logger.debug(f"Could not extract timestamp from {mp4_path}: {e}")
         return None
 
@@ -317,7 +318,7 @@ def has_audio_stream(video_path: Path) -> bool:
     try:
         probe_result = ffmpeg.probe(str(video_path))
         return any(stream['codec_type'] == 'audio' for stream in probe_result['streams'])
-    except (ffmpeg.Error, KeyError, Exception) as e:
+    except (ffmpeg.Error, KeyError, OSError) as e:
         logger.debug(f"Could not detect audio stream for {video_path}: {e}")
         return False
 

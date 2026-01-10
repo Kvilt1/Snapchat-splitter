@@ -13,6 +13,28 @@ from typing import Any, Dict, Optional
 # Third-party imports
 import pytz
 
+
+# Custom Exceptions
+class SnapchatMapperError(Exception):
+    """Base exception for Snapchat Mapper."""
+    pass
+
+
+class MediaProcessingError(SnapchatMapperError):
+    """Raised when media processing fails."""
+    pass
+
+
+class ConfigurationError(SnapchatMapperError):
+    """Raised when configuration is invalid."""
+    pass
+
+
+class TimestampExtractionError(SnapchatMapperError):
+    """Raised when timestamp extraction fails."""
+    pass
+
+
 # Configuration
 INPUT_DIR = Path("input")
 OUTPUT_DIR = Path("output")
@@ -93,7 +115,7 @@ def load_json(path: Path) -> Dict[str, Any]:
     try:
         with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
-    except Exception as e:
+    except (json.JSONDecodeError, OSError, IOError) as e:
         logger.error(f"Failed to load {path}: {e}")
         return {}
 
@@ -133,7 +155,7 @@ def safe_materialize(src: Path, dst: Path) -> bool:
         else:
             shutil.copytree(src, dst)
         return True
-    except Exception as e:
+    except (OSError, IOError, shutil.Error) as e:
         logger.error(f"Failed to materialize {src} to {dst}: {e}")
         return False
 

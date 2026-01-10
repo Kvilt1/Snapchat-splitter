@@ -25,7 +25,8 @@ from src.config import (
     get_media_type,
     MediaFile,
     Stats,
-    logger
+    logger,
+    SnapchatMapperError,
 )
 
 from src.media_processing import (
@@ -80,16 +81,16 @@ def cleanup_temp_directories():
             try:
                 logger.info(f"Cleaning up temporary directory: {temp_dir}")
                 shutil.rmtree(temp_dir)
-            except Exception as e:
+            except (OSError, PermissionError) as e:
                 logger.warning(f"Failed to clean up {temp_dir}: {e}")
-    
+
     # Clean up cache directory
     cache_dir = Path(".cache")
     if cache_dir.exists():
         try:
             logger.info(f"Cleaning up cache directory: {cache_dir}")
             shutil.rmtree(cache_dir)
-        except Exception as e:
+        except (OSError, PermissionError) as e:
             logger.warning(f"Failed to clean up cache: {e}")
     
     _temp_directories.clear()
@@ -621,13 +622,17 @@ def main():
         _log_final_summary(stats, total_time, args.output, index_stats)
         
         return 0
-        
-    except Exception as e:
+
+    except (SnapchatMapperError, OSError, ValueError, KeyError) as e:
         logger.error("=" * 60)
         logger.error(f"ERROR: {e}")
         logger.error("=" * 60)
         cleanup_temp_directories()
-
+        return 1
+    except Exception as e:
+        # Unexpected errors - log with traceback
+        logger.exception("Unexpected error occurred")
+        cleanup_temp_directories()
         return 1
 
 if __name__ == "__main__":
