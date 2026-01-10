@@ -146,7 +146,7 @@ def get_all_avatars(usernames: Set[str]) -> Dict[str, str]:
     avatars: Dict[str, str] = {}
     stats = {"success": 0, "fallback": 0}
 
-    max_workers = min(MAX_WORKERS, max(1, len(usernames)))
+    max_workers = min(MAX_BITMOJI_WORKERS, max(1, len(usernames)))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(get_avatar, name): name for name in usernames}
         for future in as_completed(futures):
