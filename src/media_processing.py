@@ -222,23 +222,18 @@ def index_media_files(source_dir: Path, merged_dir: Optional[Path] = None) -> Tu
     
     total_files = len(source_files) + len(merged_files)
     
-    # Index source files with progress bar (timestamps extracted lazily later)
+    # Index source files with progress bar (timestamps and audio extracted lazily later)
     with tqdm(total=total_files, desc="Indexing media files", unit="files") as pbar:
         for item in source_files:
             stats['total_files'] += 1
             media_id = extract_media_id(item.name)
-            
-            # Probe for audio during indexing (for video files)
-            has_audio = None
-            if item.suffix.lower() in ['.mp4', '.mov', '.avi', '.mkv', '.webm']:
-                has_audio = has_audio_stream(item)
 
             media_file = MediaFile(
                 filename=item.name,
                 source_path=item,
                 media_id=media_id,
                 timestamp=None,  # Extract lazily only when needed for timestamp mapping
-                has_audio=has_audio
+                has_audio=None  # Extract lazily only when needed for orphan rescue
             )
 
             if media_id:
@@ -251,11 +246,6 @@ def index_media_files(source_dir: Path, merged_dir: Optional[Path] = None) -> Tu
         for item in merged_files:
             stats['total_files'] += 1
             media_id = extract_media_id(item.name)
-            
-            # Probe for audio during indexing (for video files)
-            has_audio = None
-            if item.suffix.lower() in ['.mp4', '.mov', '.avi', '.mkv', '.webm']:
-                has_audio = has_audio_stream(item)
 
             media_file = MediaFile(
                 filename=item.name,
@@ -263,7 +253,7 @@ def index_media_files(source_dir: Path, merged_dir: Optional[Path] = None) -> Tu
                 media_id=media_id,
                 timestamp=None,  # Extract lazily only when needed for timestamp mapping
                 is_merged=True,
-                has_audio=has_audio
+                has_audio=None  # Extract lazily only when needed for orphan rescue
             )
 
             if media_id:
