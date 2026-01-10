@@ -14,14 +14,17 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from src.config import sanitize_filename
+from src.config import (
+    sanitize_filename,
+    TARGET_AVATAR_SIZE,
+    MAX_BITMOJI_WORKERS,
+    MIN_HUE_SEPARATION,
+    BITMOJI_API_TIMEOUT,
+    BITMOJI_RETRY_TOTAL,
+    BITMOJI_BACKOFF_FACTOR,
+)
 
 logger = logging.getLogger(__name__)
-
-# The final size of the avatar SVG
-TARGET_SIZE = 54
-# Maximum number of concurrent download threads
-MAX_WORKERS = 128
 # Path for the default "ghost" avatar icon
 FALLBACK_AVATAR_PATH = (
     "M27 54.06C33.48 54.06 39.48 51.78 44.16 47.94C43.32 46.68 42.36 45.78 41.34 44.94C38.22 42.48 "
@@ -40,12 +43,12 @@ def _build_session() -> requests.Session:
     """Configure a session with retry-aware adapters and large connection pools."""
     session = requests.Session()
     retry = Retry(
-        total=3,
-        backoff_factor=0.4,
+        total=BITMOJI_RETRY_TOTAL,
+        backoff_factor=BITMOJI_BACKOFF_FACTOR,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=("GET",),
     )
-    adapter = HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS, max_retries=retry)
+    adapter = HTTPAdapter(pool_connections=MAX_BITMOJI_WORKERS, pool_maxsize=MAX_BITMOJI_WORKERS, max_retries=retry)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     session.headers.update({"User-Agent": "snapchat-media-mapper/1.0"})
@@ -75,9 +78,8 @@ class FallbackGenerator:
 
             hue = base_hue
             attempt = 0
-            min_separation = 15.0  # Minimum distance between hues on the color wheel
 
-            while any(abs(hue - h) < min_separation for h in self._assigned_hues):
+            while any(abs(hue - h) < MIN_HUE_SEPARATION for h in self._assigned_hues):
                 hue = (base_hue + 137.508 * attempt) % 360.0
                 attempt += 1
                 if attempt > 360:
@@ -95,7 +97,7 @@ class FallbackGenerator:
         """Build the complete fallback SVG string for a username."""
         fill_color = self._get_distinct_color(username)
         return (
-            f'<svg viewBox="0 0 {TARGET_SIZE} {TARGET_SIZE}" xmlns="http://www.w3.org/2000/svg">'
+            f'<svg viewBox="0 0 {TARGET_AVATAR_SIZE} {TARGET_AVATAR_SIZE}" xmlns="http://www.w3.org/2000/svg">'
             f'<path d="{FALLBACK_AVATAR_PATH}" fill="{fill_color}" '
             'stroke="black" stroke-opacity="0.2" stroke-width="0.9"/>'
             '</svg>'
@@ -109,7 +111,7 @@ def get_avatar(username: str) -> tuple[str, str, str]:
     """Fetch, process, and normalize a Bitmoji avatar, with fallback on failure."""
     try:
         params = {"username": username, "type": "SVG", "bitmoji": "enable"}
-        response = SESSION.get("https://app.snapchat.com/web/deeplink/snapcode", params=params, timeout=10)
+        response = SESSION.get("https://app.snapchat.com/web/deeplink/snapcode", params=params, timeout=BITMOJI_API_TIMEOUT)
         response.raise_for_status()
 
         root = ET.fromstring(response.text)

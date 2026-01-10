@@ -1,30 +1,35 @@
 """Media processing: overlay merging, indexing, and mapping."""
 
+# Standard library imports
 import hashlib
 import json
 import logging
 import os
 import re
 import shutil
-import struct
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-from bisect import bisect_left, bisect_right
+from typing import Any, Dict, List, Optional, Set, Tuple
 
+# Third-party imports
+import ffmpeg
+from tqdm import tqdm
+
+# Local imports
 from src.config import (
+    DEFAULT_MERGE_WORKERS,
+    DEFAULT_TIMESTAMP_WORKERS,
+    FFMPEG_PRESET,
+    FFMPEG_CRF,
     TIMESTAMP_THRESHOLD_SECONDS,
     QUICKTIME_EPOCH_ADJUSTER,
     ensure_directory,
     MediaFile,
     Stats
 )
-
-# Direct ffmpeg-python import for overlay merging
-import ffmpeg
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +103,7 @@ def merge_overlay_pairs(source_dir: Path, output_dir: Path, max_workers: int = N
     
     # Use simple default for workers
     if max_workers is None:
-        max_workers = 4
+        max_workers = DEFAULT_MERGE_WORKERS
     
     logger.info(f"Using {max_workers} parallel workers for encoding")
 
@@ -437,7 +442,7 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
     
     # Parallel timestamp extraction
     timestamp_map = {}
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=DEFAULT_TIMESTAMP_WORKERS) as executor:
         future_to_file = {executor.submit(extract_timestamp_worker, mf): mf for mf in unmapped_mp4s}
         
         with tqdm(total=len(unmapped_mp4s), desc="Extracting timestamps", unit="files") as ts_pbar:

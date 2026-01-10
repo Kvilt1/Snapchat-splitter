@@ -52,6 +52,16 @@ from src.bitmoji import generate_bitmoji_assets
 _temp_directories = []
 _cleanup_registered = False
 
+
+def setup_logging(log_level: str) -> None:
+    """Configure logging with proper formatting."""
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper()),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+
 def register_temp_directory(temp_dir: Path):
     """Register a temporary directory for cleanup on exit."""
     global _temp_directories, _cleanup_registered
@@ -310,7 +320,7 @@ def main():
     args = parser.parse_args()
 
     # Setup logging
-    logging.basicConfig(level=getattr(logging, args.log_level.upper()))
+    setup_logging(args.log_level)
 
     logger.info("=" * 60)
     logger.info("    SNAPCHAT MEDIA MAPPER - STARTING")

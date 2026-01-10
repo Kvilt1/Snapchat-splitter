@@ -1,13 +1,16 @@
 """Configuration and utilities for Snapchat media mapper."""
 
+# Standard library imports
 import json
 import logging
 import os
 import shutil
 from dataclasses import dataclass, field
-from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+# Third-party imports
 import pytz
 
 # Configuration
@@ -22,11 +25,25 @@ FAROESE_TZ = pytz.timezone('Atlantic/Faroe')  # Faroese Atlantic Time (UTC-1/UTC
 # Performance tuning
 USE_FAST_TIMESTAMP_EXTRACTION = True  # Use ffprobe instead of manual parsing
 
-# Logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# Worker Configuration
+DEFAULT_MERGE_WORKERS = 4  # CPU-bound encoding workers
+DEFAULT_TIMESTAMP_WORKERS = 8  # I/O-bound ffprobe workers
+MAX_BITMOJI_WORKERS = 128  # Network-bound API requests
+
+# Thresholds
+MIN_HUE_SEPARATION = 15.0  # For fallback avatar color generation
+
+# Bitmoji Configuration
+TARGET_AVATAR_SIZE = 54
+BITMOJI_API_TIMEOUT = 10
+BITMOJI_RETRY_TOTAL = 3
+BITMOJI_BACKOFF_FACTOR = 0.4
+
+# FFmpeg Configuration
+FFMPEG_PRESET = 'ultrafast'
+FFMPEG_CRF = '23'
+
+# Logging (configured in main.py)
 logger = logging.getLogger(__name__)
 
 # Media type mappings
