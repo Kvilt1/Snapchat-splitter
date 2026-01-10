@@ -130,12 +130,18 @@ def sanitize_filename(filename: str) -> str:
     import re
     return re.sub(r'[\\/*?:"<>|]', "", filename)[:255]
 
-def safe_materialize(src: Path, dst: Path) -> bool:
+def safe_materialize(src: Path, dst: Path, ensure_dir: bool = False) -> bool:
     """
     Efficiently materialize a file from src to dst.
     Tries: hardlink -> copy. Returns True on success.
+
+    Args:
+        src: Source file path
+        dst: Destination file path
+        ensure_dir: If True, ensure parent directory exists (default False for performance)
     """
-    ensure_directory(dst.parent)
+    if ensure_dir:
+        ensure_directory(dst.parent)
 
     # Don't copy if already exists
     if dst.exists():
