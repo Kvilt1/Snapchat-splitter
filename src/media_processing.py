@@ -38,12 +38,13 @@ def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path) ->
     """Merge media with overlay using libx264 (universal CPU encoder)."""
     try:
         vid = ffmpeg.input(str(media_file))
-        overlay_img = ffmpeg.input(str(overlay_file))
-        
-        # Scale overlay to match video height
+        # Read WebP as single frame with error tolerance - no loop to prevent freeze
+        overlay_img = ffmpeg.input(str(overlay_file), **{'err_detect': 'ignore_err', 'max_error_rate': '1.0'})
+
+        # Scale overlay to match video dimensions and repeat the single frame for video duration
         scaled = overlay_img.filter("scale", "-1", "rh")
-        overlay_video = vid.overlay(scaled, eof_action="repeat")
-        
+        overlay_video = vid.overlay(scaled, eof_action="pass", repeatlast=1)
+
         # Check for audio stream
         try:
             probe_result = ffmpeg.probe(str(media_file))
@@ -51,13 +52,14 @@ def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path) ->
         except (ffmpeg.Error, KeyError, OSError) as e:
             logger.debug(f"Could not probe audio stream for {media_file}: {e}")
             has_audio = False
-        
-        # Use libx264 with ultrafast preset
+
+        # Use libx264 with ultrafast preset and shortest flag
         output_options = {
             'vcodec': 'libx264',
             'preset': 'ultrafast',
             'crf': '23',
-            'map_metadata': 0
+            'map_metadata': 0,
+            'shortest': None  # Stop when shortest input (video) ends
         }
         
         # Create output with or without audio
@@ -70,10 +72,11 @@ def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_path: Path) ->
         return True
         
     except ffmpeg.Error as err:
-        logger.error(f"ffmpeg error: {err.stderr.decode('utf-8') if err.stderr else 'No stderr'}")
+        error_msg = err.stderr.decode('utf-8') if err.stderr else 'No stderr'
+        logger.warning(f"Skipping merge for {media_file.name}: ffmpeg error - {error_msg[:200]}...")
         return False
     except (OSError, IOError, ValueError) as e:
-        logger.error(f"Error merging {media_file.name}: {e}")
+        logger.warning(f"Skipping merge for {media_file.name}: {e}")
         return False
 
 def calculate_file_hash(file_path: Path) -> Optional[str]:
@@ -113,7 +116,7 @@ def merge_overlay_pairs(source_dir: Path, output_dir: Path, max_workers: int = N
     
     # Collect all merge operations
     merge_operations = []
-    stats = {'total_media': 0, 'total_overlay': 0, 'total_merged': 0}
+    stats = {'total_media': 0, 'total_overlay': 0, 'total_merged': 0, 'skipped': 0}
     
     # Group files by date
     files_by_date = defaultdict(lambda: {"media": [], "overlay": []})
@@ -177,9 +180,12 @@ def merge_overlay_pairs(source_dir: Path, output_dir: Path, max_workers: int = N
                     merged_files.add(media_name)
                     merged_files.add(overlay_name)
                     stats['total_merged'] += 1
+                else:
+                    stats['skipped'] += 1
                 pbar.update(1)
 
-    logger.info(f"Completed {stats['total_merged']}/{len(merge_operations)} merge operations")
+    logger.info(f"Completed {stats['total_merged']}/{len(merge_operations)} merge operations "
+                f"({stats['skipped']} skipped due to errors)")
     logger.info("=" * 60)
     return merged_files, stats
 
