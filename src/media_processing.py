@@ -2,7 +2,6 @@
 
 # Standard library imports
 import hashlib
-import json
 import logging
 import os
 import re
@@ -10,7 +9,6 @@ import shutil
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -21,11 +19,9 @@ from tqdm import tqdm
 # Local imports
 from src.config import (
     DEFAULT_MERGE_WORKERS,
-    DEFAULT_TIMESTAMP_WORKERS,
     FFMPEG_PRESET,
     FFMPEG_CRF,
-    TIMESTAMP_THRESHOLD_SECONDS,
-    QUICKTIME_EPOCH_ADJUSTER,
+    TIMESTAMP_THRESHOLD_MS,
     ensure_directory,
     MediaFile,
     Stats
@@ -273,31 +269,22 @@ def index_media_files(source_dir: Path, merged_dir: Optional[Path] = None) -> Tu
 
     return media_index, stats
 
-def extract_mp4_timestamp_fast(mp4_path: Path) -> Optional[int]:
-    """Extract creation timestamp using ffprobe."""
-    try:
-        probe = ffmpeg.probe(str(mp4_path))
-        
-        # Try format tags
-        if 'format' in probe and 'tags' in probe['format']:
-            creation_time = probe['format']['tags'].get('creation_time')
-            if creation_time:
-                dt = datetime.fromisoformat(creation_time.replace('Z', '+00:00'))
-                return int(dt.timestamp() * 1000)
-        
-        # Try streams
-        if 'streams' in probe:
-            for stream in probe['streams']:
-                if stream.get('codec_type') == 'video':
-                    creation_time = stream.get('tags', {}).get('creation_time')
-                    if creation_time:
-                        dt = datetime.fromisoformat(creation_time.replace('Z', '+00:00'))
-                        return int(dt.timestamp() * 1000)
-        
-        return None
+def get_file_mtime_ms(file_path: Path) -> Optional[int]:
+    """Get file modification time as milliseconds since epoch.
 
-    except (ffmpeg.Error, ValueError, KeyError, OSError) as e:
-        logger.debug(f"Could not extract timestamp from {mp4_path}: {e}")
+    This is used for timestamp-based media mapping when files have been
+    extracted from zip archives with preserved modification times.
+
+    Args:
+        file_path: Path to the file
+
+    Returns:
+        Modification time in milliseconds, or None on error
+    """
+    try:
+        return int(file_path.stat().st_mtime * 1000)
+    except (OSError, IOError) as e:
+        logger.debug(f"Could not get mtime for {file_path}: {e}")
         return None
 
 
@@ -416,47 +403,28 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
                 
                 pbar.update(1)
 
-    # Phase 2: Map unmapped files by timestamp using BINARY SEARCH
-    logger.info("Phase 2: Mapping by timestamp (optimized with binary search)...")
+    # Phase 2: Map unmapped files by timestamp using file mtime + BINARY SEARCH
+    logger.info("Phase 2: Mapping by file modification time (mtime from zip)...")
 
     # Build optimized timestamp index - O(n log n)
     sorted_timestamps, timestamp_to_messages = build_timestamp_index(conversations)
     logger.debug(f"Built timestamp index with {len(sorted_timestamps)} unique timestamps")
 
-    # Map unmapped files with timestamps
-    threshold_ms = TIMESTAMP_THRESHOLD_SECONDS * 1000
-    
-    # Count unmapped MP4 files (need timestamps)
-    unmapped_mp4s = [mf for mf in media_index.values() 
-                     if mf.filename not in mapped_files and mf.source_path.suffix.lower() == '.mp4']
-    
-    logger.info(f"Extracting timestamps from {len(unmapped_mp4s)} unmapped MP4 files...")
-    
-    # Extract timestamps in parallel for unmapped MP4s only
-    def extract_timestamp_worker(media_file: MediaFile) -> Tuple[str, Optional[int]]:
-        ts = extract_mp4_timestamp_fast(media_file.source_path)
-        return (media_file.filename, ts)
-    
-    # Parallel timestamp extraction
-    timestamp_map = {}
-    with ThreadPoolExecutor(max_workers=DEFAULT_TIMESTAMP_WORKERS) as executor:
-        future_to_file = {executor.submit(extract_timestamp_worker, mf): mf for mf in unmapped_mp4s}
-        
-        with tqdm(total=len(unmapped_mp4s), desc="Extracting timestamps", unit="files") as ts_pbar:
-            for future in as_completed(future_to_file):
-                filename, timestamp = future.result()
-                if timestamp:
-                    timestamp_map[filename] = timestamp
-                ts_pbar.update(1)
-    
-    # Apply timestamps to media files
-    for mf in media_index.values():
-        if mf.filename in timestamp_map:
-            mf.timestamp = timestamp_map[mf.filename]
-    
-    # Get unmapped files that now have timestamps
-    unmapped_with_ts = [mf for mf in unmapped_mp4s if mf.timestamp]
-    
+    threshold_ms = TIMESTAMP_THRESHOLD_MS
+
+    # Get ALL unmapped files (not just MP4s) and populate timestamps from file mtime
+    unmapped_files = [mf for mf in media_index.values()
+                      if mf.filename not in mapped_files]
+
+    logger.info(f"Reading file modification times for {len(unmapped_files)} unmapped files...")
+
+    for mf in unmapped_files:
+        mf.timestamp = get_file_mtime_ms(mf.source_path)
+
+    # Get unmapped files that have timestamps
+    unmapped_with_ts = [mf for mf in unmapped_files if mf.timestamp]
+    logger.info(f"Attempting to match {len(unmapped_with_ts)} files by mtime")
+
     with tqdm(total=len(unmapped_with_ts), desc="Mapping by timestamp", unit="files") as pbar:
         for media_file in unmapped_with_ts:
             # Find matches using binary search - O(log n)

@@ -38,18 +38,13 @@ class TimestampExtractionError(SnapchatMapperError):
 # Configuration
 INPUT_DIR = Path("input")
 OUTPUT_DIR = Path("output")
-TIMESTAMP_THRESHOLD_SECONDS = 60
-QUICKTIME_EPOCH_ADJUSTER = 2082844800
+TIMESTAMP_THRESHOLD_MS = 3600000  # 1 hour tolerance for mtime-based timestamp mapping
 
 # Timezone configuration
 FAROESE_TZ = pytz.timezone('Atlantic/Faroe')  # Faroese Atlantic Time (UTC-1/UTC+0 with DST)
 
-# Performance tuning
-USE_FAST_TIMESTAMP_EXTRACTION = True  # Use ffprobe instead of manual parsing
-
 # Worker Configuration
 DEFAULT_MERGE_WORKERS = 4  # CPU-bound encoding workers
-DEFAULT_TIMESTAMP_WORKERS = 8  # I/O-bound ffprobe workers
 MAX_BITMOJI_WORKERS = 128  # Network-bound API requests
 
 # Thresholds

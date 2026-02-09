@@ -49,6 +49,7 @@ from src.conversation import (
 )
 
 from src.bitmoji import generate_bitmoji_assets
+from src.zip_extraction import extract_zips
 
 # Global cleanup registry
 _temp_directories = []
@@ -108,14 +109,23 @@ def signal_handler(signum, frame):
     sys.exit(130)  # Standard exit code for SIGINT
 
 def find_export_folder(input_dir: Path) -> Path:
-    """Find Snapchat export folder."""
+    """Find Snapchat export folder.
+
+    Checks if input_dir itself contains json/ and chat_media/ (for extracted zips),
+    then falls back to searching subdirectories.
+    """
+    # Check if the directory itself is a valid export
+    if (input_dir / "json").exists() and (input_dir / "chat_media").exists():
+        return input_dir
+
     for d in input_dir.iterdir():
         if d.is_dir() and (d / "json").exists() and (d / "chat_media").exists():
             return d
-    
+
     raise FileNotFoundError(
         f"No valid Snapchat export found in '{input_dir}'. "
-        "Place your export folder (e.g., 'mydata') inside 'input' directory."
+        "Place your export folder (e.g., 'mydata') inside 'input' directory, "
+        "or place zip files in 'input' for automatic extraction."
     )
 
 def _log_phase_header(phase_name: str) -> None:
@@ -342,8 +352,21 @@ def main():
             logger.info(f"Cleaning output directory: {args.output}")
             shutil.rmtree(args.output)
 
-        # Find export folder
-        export_dir = find_export_folder(args.input)
+        # ZIP EXTRACTION: Extract from zips if present, preserving file timestamps
+        zip_tmp_dir = Path("_tmp_extract")
+        has_zips = any(args.input.glob("*.zip"))
+
+        if has_zips:
+            logger.info("Zip files detected in input directory")
+            if zip_tmp_dir.exists():
+                logger.info("Cleaning previous temp extraction...")
+                shutil.rmtree(zip_tmp_dir)
+            register_temp_directory(zip_tmp_dir)
+            extract_zips(args.input, zip_tmp_dir)
+            export_dir = find_export_folder(zip_tmp_dir)
+        else:
+            export_dir = find_export_folder(args.input)
+
         json_dir = export_dir / "json"
         source_media_dir = export_dir / "chat_media"
 
