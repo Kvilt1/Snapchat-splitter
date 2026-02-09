@@ -6,10 +6,16 @@ import logging
 import shutil
 import sys
 import time
+import signal
+import atexit
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, Set
+from typing import Dict, Set, List, Any
+from collections import defaultdict
 
-from config import (
+from tqdm import tqdm
+
+from src.config import (
     INPUT_DIR,
     OUTPUT_DIR,
     ensure_directory,
@@ -17,73 +23,305 @@ from config import (
     save_json,
     sanitize_filename,
     safe_materialize,
+    get_media_type,
+    MediaFile,
     Stats,
-    logger
+    logger,
+    SnapchatMapperError,
 )
 
-from media_processing import (
+from src.media_processing import (
     merge_overlay_pairs,
     index_media_files,
     map_media_to_messages,
-    cleanup_process_pool
+    has_audio_stream
 )
 
-from conversation import (
+from src.conversation import (
     merge_conversations,
     determine_account_owner,
     create_conversation_metadata,
-    get_conversation_folder_name
+    get_conversation_folder_name,
+    group_messages_by_day,
+    generate_index_json,
+    extract_date_from_filename,
+    convert_message_timestamp
 )
 
+from src.bitmoji import generate_bitmoji_assets
+from src.zip_extraction import extract_zips
+
+# Global cleanup registry
+_temp_directories = []
+_cleanup_registered = False
+
+
+def setup_logging(log_level: str) -> None:
+    """Configure logging with proper formatting."""
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper()),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+
+def register_temp_directory(temp_dir: Path):
+    """Register a temporary directory for cleanup on exit."""
+    global _temp_directories, _cleanup_registered
+    _temp_directories.append(temp_dir)
+    
+    if not _cleanup_registered:
+        atexit.register(cleanup_temp_directories)
+        _cleanup_registered = True
+
+def cleanup_temp_directories():
+    """Clean up all registered temporary directories."""
+    global _temp_directories
+    
+    for temp_dir in _temp_directories:
+        if temp_dir.exists():
+            try:
+                logger.info(f"Cleaning up temporary directory: {temp_dir}")
+                shutil.rmtree(temp_dir)
+            except (OSError, PermissionError) as e:
+                logger.warning(f"Failed to clean up {temp_dir}: {e}")
+
+    # Clean up cache directory
+    cache_dir = Path(".cache")
+    if cache_dir.exists():
+        try:
+            logger.info(f"Cleaning up cache directory: {cache_dir}")
+            shutil.rmtree(cache_dir)
+        except (OSError, PermissionError) as e:
+            logger.warning(f"Failed to clean up cache: {e}")
+    
+    _temp_directories.clear()
+
+def signal_handler(signum, frame):
+    """Handle Ctrl+C and other signals."""
+    logger.info("\n" + "=" * 60)
+    logger.info("INTERRUPTED - Cleaning up and exiting...")
+    logger.info("=" * 60)
+    
+    cleanup_temp_directories()
+    
+    logger.info("Cleanup complete. Exiting.")
+    sys.exit(130)  # Standard exit code for SIGINT
+
 def find_export_folder(input_dir: Path) -> Path:
-    """Find Snapchat export folder."""
+    """Find Snapchat export folder.
+
+    Checks if input_dir itself contains json/ and chat_media/ (for extracted zips),
+    then falls back to searching subdirectories.
+    """
+    # Check if the directory itself is a valid export
+    if (input_dir / "json").exists() and (input_dir / "chat_media").exists():
+        return input_dir
+
     for d in input_dir.iterdir():
         if d.is_dir() and (d / "json").exists() and (d / "chat_media").exists():
             return d
-    
+
     raise FileNotFoundError(
         f"No valid Snapchat export found in '{input_dir}'. "
-        "Place your export folder (e.g., 'mydata') inside 'input' directory."
+        "Place your export folder (e.g., 'mydata') inside 'input' directory, "
+        "or place zip files in 'input' for automatic extraction."
     )
 
-def process_conversation_media(conv_id: str, messages: list, mapping: dict,
-                             conv_dir: Path) -> None:
-    """Materialize media files for a conversation on demand."""
-    if not mapping:
-        return
+def _log_phase_header(phase_name: str) -> None:
+    """Log a phase header with separators.
+    
+    Args:
+        phase_name: Name of the phase to log
+    """
+    logger.info("=" * 60)
+    logger.info(f"PHASE: {phase_name}")
+    logger.info("=" * 60)
 
-    media_dir = conv_dir / "media"
-    ensure_directory(media_dir)
 
-    for msg_idx, items in mapping.items():
-        if msg_idx >= len(messages):
-            continue
+def _load_json_files(json_dir: Path) -> tuple[Dict, Dict, Dict]:
+    """Load required JSON files with progress tracking.
+    
+    Args:
+        json_dir: Directory containing JSON files
+        
+    Returns:
+        Tuple of (chat_data, snap_data, friends_json)
+    """
+    json_files = ["chat_history.json", "snap_history.json", "friends.json"]
+    with tqdm(total=len(json_files), desc="Loading JSON data", unit="files") as pbar:
+        pbar.set_postfix_str("chat_history.json")
+        chat_data = load_json(json_dir / "chat_history.json")
+        pbar.update(1)
+        
+        pbar.set_postfix_str("snap_history.json")
+        snap_data = load_json(json_dir / "snap_history.json")
+        pbar.update(1)
+        
+        pbar.set_postfix_str("friends.json")
+        friends_json = load_json(json_dir / "friends.json")
+        pbar.update(1)
+    
+    return chat_data, snap_data, friends_json
 
-        media_locations = []
-        matched_files = []
 
-        for item in items:
-            media_file = item["media_file"]
-            dest = media_dir / media_file.filename
+def _rescue_orphaned_media(
+    orphaned_media: List[MediaFile],
+    day_conversations: Dict[str, List[Dict]],
+    day_media_dir: Path
+) -> tuple[Set[str], Dict[str, Any]]:
+    """
+    Rescue orphaned media when there's exactly one unambiguous match.
+    
+    Args:
+        orphaned_media: List of orphaned MediaFile objects for this day
+        day_conversations: Conversations for this day {conv_id: [messages]}
+        day_media_dir: Directory for the day's media files
+        
+    Returns:
+        (rescued_filenames, rescue_metadata) - rescued files and their mapping details
+    """
+    if not orphaned_media:
+        return set(), {}
+    
+    # Build filename -> MediaFile lookup
+    media_lookup = {mf.filename: mf for mf in orphaned_media}
+    
+    # Classify orphaned media by compatible message types
+    orphan_by_type = {}  # {filename: [compatible_types]}
+    
+    for media_file in orphaned_media:
+        ext = media_file.source_path.suffix.lower()
+        compatible_types = []
+        
+        if ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']:
+            # Image files can match IMAGE or MEDIA
+            compatible_types = ['IMAGE', 'MEDIA']
+        elif ext in ['.mp4', '.mov', '.avi', '.mkv', '.webm']:
+            # Video files: check for audio
+            has_audio = has_audio_stream(media_file.source_path)
+            if has_audio:
+                # Video with audio can match VIDEO or MEDIA
+                compatible_types = ['VIDEO', 'MEDIA']
+            else:
+                # Video without audio can only match NOTE
+                compatible_types = ['NOTE']
+        
+        if compatible_types:
+            orphan_by_type[media_file.filename] = compatible_types
+    
+    # Find messages without media in this day
+    messages_by_type = {}  # {media_type: [(conv_id, msg_idx, message)]}
+    
+    for conv_id, messages in day_conversations.items():
+        for msg_idx, msg in enumerate(messages):
+            # Skip messages that already have media
+            if msg.get('_media'):
+                continue
+            
+            media_type = msg.get('Media Type', '')
+            if media_type in ['IMAGE', 'VIDEO', 'MEDIA', 'NOTE']:
+                if media_type not in messages_by_type:
+                    messages_by_type[media_type] = []
+                messages_by_type[media_type].append((conv_id, msg_idx, msg))
+    
+    # Find unambiguous matches
+    rescued = {}  # {filename: (conv_id, msg_idx, media_type)}
+    
+    for filename, compatible_types in orphan_by_type.items():
+        # Count how many messages of each compatible type exist
+        eligible_messages = []
+        for media_type in compatible_types:
+            if media_type in messages_by_type:
+                eligible_messages.extend([(conv_id, msg_idx, msg, media_type) 
+                                         for conv_id, msg_idx, msg in messages_by_type[media_type]])
+        
+        # Only rescue if exactly 1 eligible message exists
+        if len(eligible_messages) == 1:
+            conv_id, msg_idx, msg, media_type = eligible_messages[0]
+            rescued[filename] = (conv_id, msg_idx, media_type)
+    
+    # Apply rescues - materialize files and update messages
+    rescued_filenames = set()
+    rescue_metadata = {}
+    
+    for filename, (conv_id, msg_idx, media_type) in rescued.items():
+        media_file = media_lookup[filename]
+        # Materialize the file to the media directory
+        dest = day_media_dir / media_file.filename
+        if safe_materialize(media_file.source_path, dest):
+            # Update the message
+            msg = day_conversations[conv_id][msg_idx]
+            msg.setdefault('_media', []).append({
+                'media_file': media_file,
+                'mapping_method': 'orphan_rescue'
+            })
+            
+            rescued_filenames.add(media_file.filename)
+            rescue_metadata[media_file.filename] = {
+                'conv_id': conv_id,
+                'msg_idx': msg_idx,
+                'media_type': media_type
+            }
+    
+    return rescued_filenames, rescue_metadata
 
-            # Handle single file
-            if safe_materialize(media_file.source_path, dest):
-                matched_files.append(media_file.filename)
-            location = f"media/{media_file.filename}"
-            media_locations.append(location)
 
-        # Update message
-        messages[msg_idx]["media_locations"] = media_locations
-        messages[msg_idx]["matched_media_files"] = matched_files
-        messages[msg_idx]["is_grouped"] = False  # All files are now individual
-        messages[msg_idx]["mapping_method"] = items[0]["mapping_method"]
+def _log_final_summary(stats: Stats, total_time: float, output_dir: Path, index_stats: Dict) -> None:
+    """Log the final processing summary with detailed statistics.
+    
+    Args:
+        stats: Processing statistics object
+        total_time: Total processing time in seconds
+        output_dir: Output directory path
+        index_stats: Index statistics dictionary
+    """
+    logger.info("=" * 60)
+    logger.info("         PROCESSING COMPLETE - SUMMARY")
+    logger.info("=" * 60)
 
-        if "time_diff_seconds" in items[0]:
-            messages[msg_idx]["time_diff_seconds"] = items[0]["time_diff_seconds"]
+    # Calculate totals
+    total_media_discovered = stats.total_media + stats.total_overlay
+    total_processed = stats.total_merged + (index_stats.get('total_files', 0) - stats.total_merged)
+    total_mapped = stats.mapped_by_id + stats.mapped_by_timestamp
+
+    logger.info(f"Total media files discovered:        {total_media_discovered}")
+    logger.info(f"Successfully processed:              {total_processed}")
+    if total_media_discovered > 0:
+        process_pct = (total_processed / total_media_discovered) * 100
+        logger.info(f"  - Processing rate:                 {process_pct:.1f}%")
+    logger.info(f"  - Merged with overlays:            {stats.total_merged}")
+
+    logger.info("")
+    logger.info("Mapping Results:")
+    logger.info(f"  - Mapped by Media ID:              {stats.mapped_by_id}")
+    logger.info(f"  - Mapped by timestamp:             {stats.mapped_by_timestamp}")
+    if stats.rescued_orphans > 0:
+        logger.info(f"  - Rescued orphans (smart match):   {stats.rescued_orphans}")
+    logger.info(f"  - Total mapped:                    {total_mapped + stats.rescued_orphans}")
+    logger.info(f"  - Orphaned (unmapped):             {stats.orphaned}")
+
+    if total_processed > 0:
+        map_pct = ((total_mapped + stats.rescued_orphans) / total_processed) * 100
+        logger.info(f"  - Mapping success rate:            {map_pct:.1f}%")
+
+    logger.info("")
+    logger.info("Processing Time:")
+    for phase, duration in stats.phase_times.items():
+        logger.info(f"  - {phase.replace('_', ' ').title():<30} {duration:.1f}s")
+    logger.info(f"  - {'Total':<30} {total_time:.1f}s")
+    
+    logger.info("=" * 60)
+    logger.info(f"✓ Check '{output_dir}' directory for results")
+    logger.info("=" * 60)
 
 
 def main():
     """Main processing function."""
+    # Register signal handlers for clean shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     start_time = time.time()
 
     parser = argparse.ArgumentParser(description="Process Snapchat export data")
@@ -94,28 +332,41 @@ def main():
     args = parser.parse_args()
 
     # Setup logging
-    logging.basicConfig(level=getattr(logging, args.log_level.upper()))
+    setup_logging(args.log_level)
 
     logger.info("=" * 60)
     logger.info("    SNAPCHAT MEDIA MAPPER - STARTING")
     logger.info("=" * 60)
+    logger.info("Press Ctrl+C to stop and clean up at any time")
 
     stats = Stats()
+    bitmoji_executor = None  # Track for cleanup in error handlers
 
     try:
         # INITIALIZATION PHASE
         phase_start = time.time()
-        logger.info("=" * 60)
-        logger.info("PHASE: INITIALIZATION")
-        logger.info("=" * 60)
+        _log_phase_header("INITIALIZATION")
 
         # Clean output if requested
         if not args.no_clean and args.output.exists():
             logger.info(f"Cleaning output directory: {args.output}")
             shutil.rmtree(args.output)
 
-        # Find export folder
-        export_dir = find_export_folder(args.input)
+        # ZIP EXTRACTION: Extract from zips if present, preserving file timestamps
+        zip_tmp_dir = Path("_tmp_extract")
+        has_zips = any(args.input.glob("*.zip"))
+
+        if has_zips:
+            logger.info("Zip files detected in input directory")
+            if zip_tmp_dir.exists():
+                logger.info("Cleaning previous temp extraction...")
+                shutil.rmtree(zip_tmp_dir)
+            register_temp_directory(zip_tmp_dir)
+            extract_zips(args.input, zip_tmp_dir)
+            export_dir = find_export_folder(zip_tmp_dir)
+        else:
+            export_dir = find_export_folder(args.input)
+
         json_dir = export_dir / "json"
         source_media_dir = export_dir / "chat_media"
 
@@ -126,6 +377,7 @@ def main():
         phase_start = time.time()
         # Create a temporary directory for merged files (not in output)
         temp_merged_dir = export_dir.parent / f"temp_merged_{int(time.time())}"
+        register_temp_directory(temp_merged_dir)  # Register for cleanup
         merged_files, merge_stats = merge_overlay_pairs(source_media_dir, temp_merged_dir)
         stats.total_media = merge_stats.get('total_media', 0)
         stats.total_overlay = merge_stats.get('total_overlay', 0)
@@ -134,18 +386,16 @@ def main():
 
         # DATA LOADING PHASE
         phase_start = time.time()
-        logger.info("=" * 60)
-        logger.info("PHASE: DATA LOADING AND PROCESSING")
-        logger.info("=" * 60)
+        _log_phase_header("DATA LOADING AND PROCESSING")
 
-        chat_data = load_json(json_dir / "chat_history.json")
-        snap_data = load_json(json_dir / "snap_history.json")
-        friends_json = load_json(json_dir / "friends.json")
+        # Load JSON files with progress indication
+        chat_data, snap_data, friends_json = _load_json_files(json_dir)
 
         if not chat_data and not snap_data:
             raise ValueError("No chat or snap data found")
 
         # Process conversations
+        logger.info("Merging conversation data...")
         conversations = merge_conversations(chat_data, snap_data)
         account_owner = determine_account_owner(conversations)
 
@@ -158,153 +408,263 @@ def main():
         merged_media_dir = temp_merged_dir / "merged_media" if temp_merged_dir.exists() else None
         media_index, index_stats = index_media_files(source_media_dir, merged_media_dir)
 
-        mappings, mapped_files, mapping_stats = map_media_to_messages(conversations, media_index)
+        mapped_files, mapping_stats = map_media_to_messages(conversations, media_index)
         stats.mapped_by_id = mapping_stats.get('mapped_by_id', 0)
         stats.mapped_by_timestamp = mapping_stats.get('mapped_by_timestamp', 0)
         stats.phase_times['media_mapping'] = time.time() - phase_start
 
-        # OUTPUT ORGANIZATION PHASE
+        # DAY-BASED OUTPUT ORGANIZATION PHASE
         phase_start = time.time()
-        logger.info("=" * 60)
-        logger.info("PHASE: OUTPUT ORGANIZATION")
-        logger.info("=" * 60)
+        _log_phase_header("DAY-BASED OUTPUT ORGANIZATION")
 
         ensure_directory(args.output)
 
-        conversation_count = 0
-        materialized_files = set()
+        # Group messages by Faroese calendar day
+        logger.info("Grouping messages by Faroese calendar day...")
+        days_data = group_messages_by_day(conversations)
+        all_days = sorted(days_data.keys())
+        
+        logger.info(f"Found activity across {len(all_days)} days ({all_days[0]} to {all_days[-1]})")
 
-        for conv_id, messages in conversations.items():
-            if not messages:
-                continue
+        # Generate index.json with all conversation metadata
+        logger.info("Generating index.json...")
+        index_json = generate_index_json(conversations, friends_json, account_owner, days_data)
 
-            # Create metadata
-            metadata = create_conversation_metadata(conv_id, messages, friends_json, account_owner)
+        # Start Bitmoji generation in background (network-bound, can run while processing days)
+        _log_phase_header("BITMOJI GENERATION")
 
-            # Create output directory
-            folder_name = get_conversation_folder_name(metadata, messages)
-            folder_name = sanitize_filename(folder_name)
+        # Extract all unique usernames from index_json
+        all_usernames = {user["username"] for user in index_json["users"]}
+        logger.info(f"[Background] Starting Bitmoji generation for {len(all_usernames)} users...")
 
-            is_group = metadata["conversation_type"] == "group"
-            base_dir = args.output / "groups" if is_group else args.output / "conversations"
-            conv_dir = base_dir / folder_name
-            ensure_directory(conv_dir)
+        # Start bitmoji generation in background thread
+        bitmoji_executor = ThreadPoolExecutor(max_workers=1)
+        bitmoji_future = bitmoji_executor.submit(generate_bitmoji_assets, all_usernames, args.output)
 
-            # Process media
-            if conv_id in mappings:
-                process_conversation_media(
-                    conv_id, messages, mappings[conv_id],
-                    conv_dir
-                )
-                # Track materialized files
-                for items in mappings[conv_id].values():
-                    for item in items:
-                        materialized_files.add(item["media_file"].filename)
+        # Create days folder
+        days_dir = args.output / "days"
+        ensure_directory(days_dir)
 
-            # Save conversation data
-            save_json({
-                "conversation_metadata": metadata,
-                "messages": messages
-            }, conv_dir / "conversation.json")
-
-            conversation_count += 1
-
-        logger.info(f"Organized {conversation_count} conversations")
-        stats.phase_times['output_organization'] = time.time() - phase_start
-
-        # ORPHANED MEDIA PHASE
-        phase_start = time.time()
-        logger.info("=" * 60)
-        logger.info("PHASE: ORPHANED MEDIA PROCESSING")
-        logger.info("=" * 60)
-
-        orphaned_dir = args.output / "orphaned"
-        orphaned_count = 0
-
-        # Find and materialize orphaned files
+        # Track orphaned media by day
+        orphaned_by_day = defaultdict(list)
         for media_id, media_file in media_index.items():
             if media_file.filename not in mapped_files:
                 # Skip thumbnails and overlays
                 if "thumbnail" in media_file.filename.lower() or "_overlay~" in media_file.filename:
                     continue
+                # Extract date from filename
+                file_date = extract_date_from_filename(media_file.filename)
+                if file_date:
+                    orphaned_by_day[file_date].append(media_file)
 
-                ensure_directory(orphaned_dir)
-                if safe_materialize(media_file.source_path, orphaned_dir / media_file.filename):
-                    orphaned_count += 1
+        # Pre-compute conversation metadata (don't recreate for each day)
+        logger.info("Pre-computing conversation metadata...")
+        conv_metadata_cache = {}
+        conv_folder_names = {}
+        for conv_id, all_messages in conversations.items():
+            if all_messages:
+                metadata = create_conversation_metadata(conv_id, all_messages, friends_json, account_owner)
+                conv_metadata_cache[conv_id] = metadata
+                folder_name = get_conversation_folder_name(metadata, all_messages)
+                conv_folder_names[conv_id] = sanitize_filename(folder_name)
 
-        stats.orphaned = orphaned_count
-        logger.info(f"Processed {orphaned_count} orphaned media files")
-        stats.phase_times['orphaned_processing'] = time.time() - phase_start
+        # Process each day and track mapping preservation
+        total_mapped_items_after = 0
+        messages_with_media = 0
+        total_rescued = 0
+        
+        with tqdm(total=len(all_days), desc="Processing days", unit="days") as day_pbar:
+            for day in all_days:
+                day_dir = days_dir / day
+                ensure_directory(day_dir)
+                
+                # Create shared media folder for this day
+                day_media_dir = day_dir / "media"
+                ensure_directory(day_media_dir)
+                
+                # Create orphaned folder
+                orphaned_dir = day_dir / "orphaned"
+                
+                # Process conversations for this day
+                day_conversations = days_data[day]
+                conversations_output = []
+                day_total_messages = 0
+                day_total_media = 0
+                
+                # ORPHAN RESCUE: Try to rescue orphaned media BEFORE building output
+                rescued_filenames = set()
+                if day in orphaned_by_day:
+                    rescued_filenames, rescue_metadata = _rescue_orphaned_media(
+                        orphaned_by_day[day],
+                        day_conversations,
+                        day_media_dir
+                    )
+                    
+                    if rescued_filenames:
+                        logger.info(f"  Day {day}: Rescued {len(rescued_filenames)} orphaned media file(s)")
+                        # Update stats
+                        total_rescued += len(rescued_filenames)
+                
+                # Process conversations and materialize media
+                for conv_id, day_messages in day_conversations.items():
+                    # Get metadata for this conversation
+                    all_messages = conversations[conv_id]
+                    metadata = conv_metadata_cache.get(conv_id)
+                    folder_name = conv_folder_names.get(conv_id)
+                    
+                    # Process each message, materializing media if attached
+                    clean_messages = []
+                    for msg in day_messages:
+                        # Process media if attached
+                        if '_media' in msg:
+                            media_locations = []
+                            matched_files = []
+                            
+                            for item in msg['_media']:
+                                media_file = item['media_file']
+                                dest = day_media_dir / media_file.filename
+                                
+                                if safe_materialize(media_file.source_path, dest):
+                                    matched_files.append(media_file.filename)
+                                media_locations.append(f"media/{media_file.filename}")
+                            
+                            msg['media_locations'] = media_locations
+                            msg['matched_media_files'] = matched_files
+                            msg['mapping_method'] = msg['_media'][0]['mapping_method']
+                            msg['is_grouped'] = False
+                            
+                            if 'time_diff_seconds' in msg['_media'][0]:
+                                msg['time_diff_seconds'] = msg['_media'][0]['time_diff_seconds']
+                            
+                            # Update stats
+                            day_total_media += len(media_locations)
+                            total_mapped_items_after += len(media_locations)
+                            messages_with_media += 1
+                        
+                        # Clean up internal fields
+                        clean_msg = {k: v for k, v in msg.items() 
+                                    if k not in ('Created(microseconds)', '_media')}
+                        clean_messages.append(clean_msg)
+                    
+                    # Build conversation entry with metadata
+                    conversation_entry = {
+                        "id": folder_name,
+                        "conversation_id": conv_id,
+                        "conversation_type": metadata.get("conversation_type") if metadata else "unknown",
+                        "messages": clean_messages
+                    }
+                    
+                    # Add group name if applicable
+                    if metadata and metadata.get("conversation_type") == "group":
+                        for msg in all_messages:
+                            if msg.get("Conversation Title"):
+                                conversation_entry["group_name"] = msg["Conversation Title"]
+                                break
+                    
+                    conversations_output.append(conversation_entry)
+                    day_total_messages += len(clean_messages)
+                
+                # Handle remaining orphaned media for this day
+                orphaned_media_list = []
+                if day in orphaned_by_day:
+                    ensure_directory(orphaned_dir)
+                    
+                    for media_file in orphaned_by_day[day]:
+                        # Skip rescued files
+                        if media_file.filename in rescued_filenames:
+                            continue
+                        
+                        safe_materialize(media_file.source_path, orphaned_dir / media_file.filename)
+                        
+                        # Determine media type from extension
+                        ext = media_file.filename.split('.')[-1]
+                        media_type = get_media_type(ext)
+                        
+                        orphaned_media_list.append({
+                            "path": f"orphaned/{media_file.filename}",
+                            "filename": media_file.filename,
+                            "type": media_type,
+                            "extension": ext.lower()
+                        })
+                
+                # Build day JSON structure
+                day_json = {
+                    "date": day,
+                    "stats": {
+                        "conversationCount": len(conversations_output),
+                        "messageCount": day_total_messages,
+                        "mediaCount": day_total_media
+                    },
+                    "conversations": conversations_output,
+                    "orphanedMedia": {
+                        "orphaned_media_count": len(orphaned_media_list),
+                        "orphaned_media": orphaned_media_list
+                    }
+                }
+                
+                # Save single conversations.json for this day
+                save_json(day_json, day_dir / "conversations.json")
+                
+                day_pbar.update(1)
+
+        total_orphaned = sum(len(files) for files in orphaned_by_day.values())
+        # Subtract rescued files from orphaned count
+        final_orphaned = total_orphaned - total_rescued
+        
+        logger.info(f"Organized {len(all_days)} days with {final_orphaned} orphaned media files")
+        if total_rescued > 0:
+            logger.info(f"Rescued {total_rescued} orphaned media files using smart matching")
+        logger.info(f"Total messages with media in output: {messages_with_media}")
+        logger.info(f"Total media items processed: {total_mapped_items_after}")
+        
+        stats.phase_times['output_organization'] = time.time() - phase_start
+        stats.rescued_orphans = total_rescued
+        stats.orphaned = final_orphaned
+
+        # Wait for background Bitmoji generation to complete and update index.json
+        logger.info("Waiting for background Bitmoji generation to complete...")
+        bitmoji_paths = bitmoji_future.result()  # Wait for completion
+        bitmoji_executor.shutdown(wait=True)
+        logger.info(f"✅ [Bitmoji Generated] Saved {len(bitmoji_paths)} avatars to output/bitmoji/")
+
+        # Update index.json with Bitmoji paths
+        for user in index_json["users"]:
+            username = user["username"]
+            user["bitmoji"] = bitmoji_paths.get(username)
+
+        # Save final index.json with Bitmoji paths
+        save_json(index_json, args.output / "index.json")
+        logger.info(f"Updated index.json with Bitmoji paths")
 
         # CLEANUP PHASE
         phase_start = time.time()
-        logger.info("=" * 60)
-        logger.info("PHASE: CLEANUP")
-        logger.info("=" * 60)
+        _log_phase_header("CLEANUP")
 
-        cleanup_process_pool()
-
-        # Clean up temporary merged directory
-        if temp_merged_dir.exists():
-            logger.info(f"Removing temporary directory: {temp_merged_dir}")
-            shutil.rmtree(temp_merged_dir)
+        cleanup_temp_directories()
 
         logger.info("Cleanup complete")
         stats.phase_times['cleanup'] = time.time() - phase_start
 
         # FINAL SUMMARY
         total_time = time.time() - start_time
-
-        logger.info("=" * 60)
-        logger.info("         PROCESSING COMPLETE - SUMMARY")
-        logger.info("=" * 60)
-
-        # Calculate totals
-        total_media_discovered = stats.total_media + stats.total_overlay
-        total_processed = stats.total_merged + (index_stats.get('total_files', 0) - stats.total_merged)
-        total_mapped = stats.mapped_by_id + stats.mapped_by_timestamp
-
-        logger.info(f"Total media files discovered:        {total_media_discovered}")
-        logger.info(f"Successfully processed:              {total_processed}")
-        if total_media_discovered > 0:
-            process_pct = (total_processed / total_media_discovered) * 100
-            logger.info(f"  - Processing rate:                 {process_pct:.1f}%")
-        logger.info(f"  - Merged with overlays:            {stats.total_merged}")
-
-        logger.info("")
-        logger.info("Mapping Results:")
-        logger.info(f"  - Mapped by Media ID:              {stats.mapped_by_id}")
-        logger.info(f"  - Mapped by timestamp:             {stats.mapped_by_timestamp}")
-        logger.info(f"  - Total mapped:                    {total_mapped}")
-        logger.info(f"  - Orphaned (unmapped):             {stats.orphaned}")
-
-        if total_processed > 0:
-            map_pct = (total_mapped / total_processed) * 100
-            logger.info(f"  - Mapping success rate:            {map_pct:.1f}%")
-
-        logger.info("")
-        logger.info("Processing Time:")
-        for phase, duration in stats.phase_times.items():
-            logger.info(f"  - {phase.replace('_', ' ').title():<30} {duration:.1f}s")
-        logger.info(f"  - {'Total':<30} {total_time:.1f}s")
-        
-        logger.info("=" * 60)
-        logger.info(f"✓ Check '{args.output}' directory for results")
-        logger.info("=" * 60)
+        _log_final_summary(stats, total_time, args.output, index_stats)
         
         return 0
-        
-    except Exception as e:
+
+    except (SnapchatMapperError, OSError, ValueError, KeyError) as e:
         logger.error("=" * 60)
         logger.error(f"ERROR: {e}")
         logger.error("=" * 60)
-        cleanup_process_pool()
-
-        # Clean up temporary merged directory on error
-        if 'temp_merged_dir' in locals() and temp_merged_dir.exists():
-            logger.info(f"Cleaning up temporary directory: {temp_merged_dir}")
-            shutil.rmtree(temp_merged_dir)
-
+        if bitmoji_executor:
+            bitmoji_executor.shutdown(wait=False)
+        cleanup_temp_directories()
+        return 1
+    except Exception as e:
+        # Unexpected errors - log with traceback
+        logger.exception("Unexpected error occurred")
+        if bitmoji_executor:
+            bitmoji_executor.shutdown(wait=False)
+        cleanup_temp_directories()
         return 1
 
 if __name__ == "__main__":
